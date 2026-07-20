@@ -87,19 +87,6 @@ El script ejecuta cuatro fases secuenciales y deterministas:
 
 **Fase 4 — Formulación matemática QUBO/Ising.** Traduce el problema de particionamiento a la función objetivo cuadrática binaria: minimizar el peso de las líneas cortadas entre islas sujeto a penalizaciones de balance de carga/generación. Genera la matriz **Q** del QUBO y, mediante el cambio de variable `s = 2x − 1`, los coeficientes equivalentes del hamiltoniano de Ising (**h**, **J**), listos para QAOA o *annealing*.
 
-## 6. Benchmarks Clásicos
-
-Ninguna afirmación sobre el desempeño de la solución cuántica se hace en el vacío: el pipeline calcula tres líneas base clásicas sobre exactamente la misma instancia QUBO.
-
-**Fuerza Bruta (óptimo exacto).** Enumeración exhaustiva de las 2^n particiones posibles sobre el grafo reducido. Es viable precisamente porque la reducción H3 lleva la instancia a escala NISQ, y provee el valor óptimo certificado contra el cual se mide el *approximation ratio* de cualquier heurística, clásica o cuántica.
-
-**Greedy (heurística local).** Asignación voluntaria nodo a nodo con mejora local. Sirve como piso de referencia: cualquier método que aspire a ser útil debe superarlo consistentemente.
-
-**Goemans-Williamson (línea base clásica fuerte).** Relajación semidefinida (SDP) del Max-Cut resuelta con CVXPY, seguida de redondeo por hiperplano aleatorio. Es el mejor algoritmo clásico aproximado con garantía teórica conocida para Max-Cut, con un ratio de aproximación garantizado **≥ 0.878** (Goemans & Williamson, 1995). Constituye la vara real que la solución cuántica debe igualar o superar: batir a Greedy es fácil; acercarse al óptimo exacto más que GW es el resultado significativo.
-
-## 7. Reproducibilidad
-
-El repositorio está diseñado para ser 100 % reproducible desde un entorno limpio: dependencias estrictamente pineadas con wheels precompilados para Python 3.12, ejecución determinista con semillas fijas en las etapas estocásticas (redondeo de GW), un único comando de ejecución y separación estricta entre datos de entrada versionados (`data/`) y artefactos de salida no versionados (`scratch/`).
 
 ## 8. Referencias
 
