@@ -1,0 +1,29 @@
+# =============================================================================
+# Proyecto Isla Verde v2.0 — Quantathon 2026 (Reto 1)
+# Dependencias del pipeline clásico de datos (modelador_red.py)
+#
+# Entorno objetivo: Python 3.12 (CPython, 64 bits)
+# Todas las versiones están pineadas (package==version) y verificadas contra
+# PyPI: cada una publica wheels cp312, por lo que la instalación es
+# reproducible sin compilación local.
+#
+# Instalación:  pip install -r requirements.txt
+# =============================================================================
+
+# --- Núcleo numérico y de datos ---
+numpy==2.1.3          # Álgebra lineal y arreglos; base de todo el stack
+pandas==2.2.3         # Lectura/normalización de los CSV del ICE
+
+# --- Modelado de grafos ---
+networkx==3.4.2       # Grafo físico de la red de transmisión y reducción NISQ
+
+# --- Optimización clásica (líneas base) ---
+cvxpy==1.6.0          # Relajación semidefinida (SDP) para Goemans-Williamson
+scipy==1.14.1         # Dependencia transitiva de CVXPY; se pinea explícitamente
+                      # para garantizar reproducibilidad del solver
+
+# --- Indexación geoespacial ---
+h3==4.1.2             # Mallas hexagonales jerárquicas (reducción geoespacial)
+
+# --- Visualización ---
+matplotlib==3.9.2     # Gráficos de la red, particiones y mapas de calor

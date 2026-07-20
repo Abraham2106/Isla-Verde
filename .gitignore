@@ -1,0 +1,43 @@
+# =============================================================================
+# Proyecto Isla Verde v2.0 — Exclusiones de control de versiones
+# =============================================================================
+
+# --- Entornos virtuales ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Bytecode y caché de Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# --- Distribución y empaquetado ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Salidas locales de trabajo (no versionar resultados intermedios) ---
+scratch/
+outputs/
+*.log
+
+# --- Caché de herramientas ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Configuración de IDEs y editores ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Temporales del sistema operativo ---
+.DS_Store
+Thumbs.db
+desktop.ini
