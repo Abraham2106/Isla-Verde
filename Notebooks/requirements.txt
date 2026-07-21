@@ -1,0 +1,22 @@
+# Quantum SDK
+pytket>=1.30
+pytket-quantinuum>=0.32
+guppylang         # check  
+
+# Classic Optimization 
+scipy>=1.12
+optax>=0.2             
+
+# Classical Baseline 
+cvxpy>=1.5             
+networkx>=3.2          
+
+# Visualization 
+jupyterlab>=4.0
+notebook>=7.0
+matplotlib>=3.8
+numpy>=1.26
+pandas>=2.1            
+
+# Utilities  
+tqdm                  
