@@ -83,7 +83,7 @@ El script ejecuta cuatro fases secuenciales y deterministas:
 
 **Fase 2 — Construcción del grafo físico y filtrado de 230 kV.** Modela la red en NetworkX como un grafo no dirigido donde los nodos son subestaciones georreferenciadas y las aristas son líneas de transmisión con sus atributos eléctricos. Se filtra el nivel de tensión de 230 kV, que constituye el anillo troncal del sistema nacional y es el nivel relevante para el análisis de fallas en cascada.
 
-**Fase 3 — Reducción geoespacial con mallas H3.** Proyecta las subestaciones sobre la malla hexagonal jerárquica H3 de Uber y agrega nodos por celda, contrayendo el grafo a una escala compatible con hardware NISQ (número de nodos ≈ número de qubits disponibles) mientras preserva la topología de interconexión y los pesos agregados de las líneas entre regiones.
+**Fase 3 — Reducción geoespacial con mallas H3.** Proyecta las subestaciones sobre la malla hexagonal jerárquica H3 y agrega nodos por celda, contrayendo el grafo a una escala compatible con hardware NISQ (número de nodos ≈ número de qubits disponibles) mientras preserva la topología de interconexión y los pesos agregados de las líneas entre regiones.
 
 **Fase 4 — Formulación matemática QUBO/Ising.** Traduce el problema de particionamiento a la función objetivo cuadrática binaria: minimizar el peso de las líneas cortadas entre islas sujeto a penalizaciones de balance de carga/generación. Genera la matriz **Q** del QUBO y, mediante el cambio de variable `s = 2x − 1`, los coeficientes equivalentes del hamiltoniano de Ising (**h**, **J**), listos para QAOA o *annealing*.
 
