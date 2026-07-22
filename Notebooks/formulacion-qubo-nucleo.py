@@ -6,9 +6,16 @@
 
 import numpy as np
 import networkx as nx
+
+import json
 from numpy.typing import NDArray
 from itertools import product
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+
 
 np.set_printoptions(precision=3, suppress=True)
 print("numpy", np.__version__, "| networkx", nx.__version__)
@@ -17,8 +24,61 @@ print("numpy", np.__version__, "| networkx", nx.__version__)
 # In[2]:
 
 
+
+def load_graph(filename):
+    """
+    Carga un grafo desde JSON personalizado.
+    Formato esperado:
+    {
+        metadata:{},
+        graph:{
+            nodes:[
+                {
+                    id:"Nodo",
+                    ...
+                }
+            ],
+            links:[
+                {
+                    source:"NodoA",
+                    target:"NodoB",
+                    weight:valor
+                }
+            ]
+        }
+    }
+
+    """
+    with open(filename, "r", encoding="utf8") as f:
+        data = json.load(f)
+    graph_data = data["graph"]
+    G = nx.Graph()
+    # -----------------------------
+    # cargar nodos
+    # -----------------------------
+
+    for node in graph_data["nodes"]:
+        node_id = node["id"]
+        attributes = node.copy()
+        # quitamos id porque NetworkX
+        # ya lo usa como clave
+        attributes.pop("id", None)
+        G.add_node(node_id, **attributes)
+    # -----------------------------
+    # cargar enlaces
+    # -----------------------------
+    for edge in graph_data["links"]:
+        G.add_edge(
+            edge["source"],
+            edge["target"],
+            weight=edge.get("weight", 1),
+            length_m=edge.get("length_m"),
+            circuits=edge.get("circuits", []),
+            parallel=edge.get("parallel", False),
+        )
+    return G
 # Grafo placeholder: 5 nodos, 7 aristas ponderadas. NO es la red del ICE.
-G = nx.Graph()
+""" G = nx.Graph()
 G.add_weighted_edges_from([
     (0, 1, 3.0),
     (1, 2, 2.0),
@@ -27,7 +87,9 @@ G.add_weighted_edges_from([
     (4, 0, 3.0),
     (0, 2, 1.0),
     (1, 3, 2.0),
-])
+]) """
+GRAPH_FILENAME = "..\scratch\isla_verde_full_graph.json"
+G = load_graph(GRAPH_FILENAME)
 
 print(f"nodos = {G.number_of_nodes()}, aristas = {G.number_of_edges()}")
 print("peso total de aristas =", sum(d['weight'] for *_ , d in G.edges(data=True)))
