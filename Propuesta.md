@@ -1,0 +1,83 @@
+# Propuesta: ISLA VERDE
+
+## Challenge 1: Red eléctrica sostenible, resiliente y verde · Quantathon CR 2026
+
+ISLA VERDE está optimizada para la rúbrica. Sus tres diferenciadores (capa geoespacial H3, consistencia física de las islas y warm-start QAOA medido) se estructuran como capas sobre un núcleo que cumple línea por línea los requisitos del brief: Max-Cut de 6-12 nodos con datos reales del ICE, líneas base GW + greedy + fuerza bruta, estadística de múltiples corridas, escalado medido en varios tamaños, ejecución en el emulador H2 de Quantinuum y reproducibilidad total desde el día 1.
+
+---
+
+## 1. Problema que resuelve
+
+Ante una falla local, el riesgo principal de una red eléctrica es el apagón en cascada. La técnica establecida para contenerlo es el islanding controlado: dividir deliberadamente la red en zonas capaces de aislarse. Siguiendo el planteamiento oficial del reto, el particionamiento se modela como Max-Cut ponderado (NP-difícil) sobre el grafo de la red de transmisión, se formula como QUBO y se resuelve con QAOA, comparando honestamente contra los mejores métodos clásicos disponibles. Sobre ese núcleo canónico, la propuesta añade dos capas de valor: restricciones físicas de autosuficiencia como extensión medida (no como formulación base) y una capa geoespacial que conecta el resultado con el territorio real de Costa Rica.
+
+## 2. Arquitectura en tres capas (de obligatoria a opcional)
+
+### Capa 0, Núcleo canónico del reto (obligatoria, días 1-2)
+
+Grafo real. Se construye una versión simplificada de la red de transmisión del ICE a partir del portal oficial de datos abiertos (datos-ice-se.opendata.arcgis.com), la fuente que el propio brief sugiere. Instancia principal: 8 nodos (subestaciones/regiones reales, con nombres), pesos de arista derivados de capacidad de línea. Instancia de escalado: 12 nodos, y una tercera de 16-20 nodos reservada para el análisis de escalado en el emulador.
+
+Presupuesto de qubits. Max-Cut estándar consume 1 qubit por nodo, sin variables auxiliares; por tanto la instancia grande de hasta 20 nodos usa ≤20 qubits y cabe holgadamente bajo el techo de 26 qubits del H2. Restricción de diseño explícita: cualquier término de penalización que introduzca variables de holgura (slack) o auxiliares (es decir, toda la Capa 2) se prueba únicamente sobre la instancia de 8 nodos, nunca sobre la instancia grande, precisamente para no exceder los 26 qubits. El conteo de qubits de cada instancia se registra en el archivo de grafo antes de enviarla al emulador.
+
+Origen y reproducibilidad de los pesos de arista. El peso de cada línea se define por una regla única y documentada: se usa la capacidad nominal (MVA o nivel de tensión) del dataset del ICE cuando el atributo esté disponible, y en su defecto una regla de respaldo fijada por escrito (p. ej. peso proporcional al inverso de la longitud de línea, o peso unitario si no hay atributo eléctrico). La regla elegida, su fuente y las simplificaciones aplicadas quedan en el archivo de grafo. Sin una regla fija los pesos no son reproducibles y el archivo de grafo (entregable obligatorio) fallaría el criterio de reproducibilidad, que tiene efecto multiplicador sobre todos los demás.
+
+Disponibilidad de datos y respaldo. El portal del ICE existe y responde, pero su contenido se carga dinámicamente y no garantiza una capa de red de transmisión con topología directamente descargable. Por eso se implementa una única función `build_graph(source)` que acepta indistintamente los datos reales del ICE o un proxy sintético basado en la topología conocida de Costa Rica (corredor de transmisión de 230 kV entre las regiones principales), aplicando en ambos casos la misma regla de pesos. Así el respaldo es una rama del pipeline y no una reescritura de emergencia; si se usa el proxy, se documenta como tal en la sección de limitaciones. La disponibilidad real de las capas del ICE se confirma antes del evento.
+
+Formulación. Max-Cut puro como QUBO, verificada contra fuerza bruta en la instancia de 6-8 nodos, con cada término documentado. Convención de signos fijada por escrito (minimización) para evitar el error común que el brief señala.
+
+Líneas base clásicas (las tres, sobre la misma instancia). Fuerza bruta para el óptimo exacto; greedy (~0.5) como piso; Goemans-Williamson vía CVXPY (~0.878) como "el método clásico más fuerte disponible" que la rúbrica exige. Esto apunta directo al nivel Excelente del criterio de línea base (15%).
+
+Denominador de la razón de aproximación. La razón se reporta como `r = E_QAOA / E_referencia`, donde `E_referencia` se declara explícitamente en cada instancia: para 8 y 12 nodos es el óptimo exacto por fuerza bruta (`r = E_QAOA / E_óptimo`); para la instancia grande de 16-20 nodos, donde la fuerza bruta deja de ser viable, se usa como denominador la mejor cota disponible (el valor de GW, o el mejor entre GW y recocido simulado), declarándolo por escrito para que la razón de la instancia grande sea comparable e interpretable frente a las pequeñas. No se mezclan denominadores sin etiquetarlos.
+
+QAOA con estadística. Barrido de p = 1, 2, 3; para cada p, mínimo 5 corridas con inicializaciones distintas, reportando media ± desviación estándar de la razón de aproximación. Gráfica obligatoria: r vs. p con barras de error, con las líneas de GW y greedy como referencias horizontales. Optimizador clásico: COBYLA/BFGS con warm-start desde búsqueda en cuadrícula si no converge (siguiendo el consejo explícito del brief).
+
+Criterio de aborto para la instancia grande. Si en la instancia de 16-20 nodos el optimizador de QAOA no converge dentro de un presupuesto de tiempo fijado de antemano (X minutos por corrida), se aborta y se reporta el intento en lugar de quemar tiempo del Día 2. El intento documentado suma en la rúbrica (ejecución sobre ambición); una instancia colgada no aporta y pone en riesgo el resto del día.
+
+### Capa 1, Plataforma oficial y warm-start (día 2, alta prioridad)
+
+Emulador H2 de Quantinuum. El pipeline se desarrolla sobre pytket, con Guppy como punto de entrada preferente al emulador, dado que el brief lo recomienda encarecidamente; la instancia principal se ejecuta también en el emulador H2, capturando el 10% de "ejecución en hardware cuántico real". El acceso al emulador/hardware suele requerir registro, credenciales y cola, y ese 10% depende de infraestructura externa fuera del control del equipo; por eso se confirman credenciales, cuotas y el flujo de envío antes del Día 2, no durante. La experiencia con Guppy (qué funcionó, qué no, qué faltó) alimenta la declaración de SDK de ≤200 palabras que es entregable obligatorio.
+
+Contingencia de acceso. Si Guppy no está operativo en un límite de ~2 horas, se cambia sin remordimiento a `pytket-quantinuum` (o equivalente vigente) para el acceso al emulador, y el intento con Guppy se documenta honestamente en la declaración de SDK, eso también suma. El brief premia ejecución sobre ambición: un acceso funcional al emulador vale más que insistir en el SDK recomendado.
+
+Warm-start QAOA. El warm-start (semilla greedy o espectral, siguiendo a Egger, Mareček y Woerner 2021) no se presenta como vía para superar a GW, sino como experimento controlado que responde una pregunta medible: *¿cuánto se estrecha la brecha entre QAOA y GW a profundidad fija cuando se inicializa con una solución clásica?* En el informe, la cita de Tate et al. (2023) se acota explícitamente: aporta el contexto teórico de por qué la pregunta es interesante (garantías sobre mixers inicializados), y no un resultado computacional que prometa superar a GW en nuestras instancias. Se desglosa por escrito la distinción entre "garantía teórica bajo supuestos" y "lo que medimos en el emulador", para que ningún juez lea la referencia como una ambición de ventaja cuántica. El presupuesto de qubits y la profundidad añadida por el warm-start se documentan, confirmando que no introduce profundidad que degrade el resultado en el emulador.
+
+### Capa 2, Restricciones físicas y capa geoespacial (día 3, extensiones)
+
+Partición con restricciones como extensión medida. El balance generación-demanda y la protección de cargas críticas (hospitales, bombeo de agua) se incorporan como términos de penalización sobre la instancia de 8 nodos (ver presupuesto de qubits en la Capa 0: las penalizaciones con variables auxiliares no se aplican a la instancia grande), comparando la partición restringida contra la de Max-Cut puro. Esto mapea a la extensión "mezcladores con restricciones / subespacios factibles" que el brief lista, y conserva el argumento de consistencia física (islas autosuficientes por construcción) sin contaminar el núcleo comparable contra GW. Métrica: porcentaje de soluciones factibles vs. p, además de r.
+
+Capa H3 como agregación y visualización, no como cuello de botella. La malla hexagonal H3 se mantiene con dos funciones acotadas: (a) metodología documentada de agregación territorial para construir los supernodos de las instancias de 12 y 16-20 nodos, con la distinción explícita de que las aristas provienen de la topología real de líneas y no de la adyacencia espacial; y (b) el mapa interactivo del pitch, donde al eliminar una línea la red se reorganiza en islas con panel de balance y porcentaje renovable por isla. La jerarquía de H3 es la respuesta a la pregunta de escalabilidad, respaldada por datos medidos en 3 tamaños en lugar de solo narrativa.
+
+Mapa estático mínimo desde el Día 1. Como parte del pipeline reproducible se genera desde el Día 1 un mapa estático en matplotlib (grafo con la partición coloreada por isla). El mapa interactivo H3 es bonus: si el tiempo aprieta, el pitch ya tiene visualización garantizada producida por el mismo pipeline que reproduce las demás figuras.
+
+## 3. Stack técnico
+
+Núcleo: Python, NetworkX (grafo), pytket (QUBO/QAOA), CVXPY (Goemans-Williamson), SciPy (optimización clásica y recocido simulado opcional), fuerza bruta propia para el óptimo. Plataforma: emulador H2 de Quantinuum (Guppy como vía preferente de acceso, `pytket-quantinuum` como respaldo). Geoespacial: h3-py sobre datos del ICE (datos-ice-se.opendata.arcgis.com). Visualización: mapa estático matplotlib (Día 1) + mapa hexagonal interactivo (bonus), ambos generados por el pipeline reproducible.
+
+Pines de versión exactos. El `requirements.txt` fija versiones exactas (no rangos) de al menos `pytket`, `guppylang`, `pytket-quantinuum`, `cvxpy`, `networkx`, `h3` y `scipy`. `pytket` y `guppylang` han tenido cambios de API entre versiones que rompen la construcción de circuitos/QAOA; un pin flojo rompe la reproducibilidad desde entorno limpio, que es justo el criterio con efecto multiplicador.
+
+## 4. Reproducibilidad como arquitectura (día 1, no día 3)
+
+Repositorio público de GitHub estructurado desde la primera hora con: `requirements.txt` con versiones exactas fijadas; un único punto de entrada (`python main.py` o notebook maestro) que regenera cada figura y cada cifra del informe (incluido el mapa estático); datos del grafo versionados con su fuente y su regla de pesos; semillas aleatorias fijadas y registradas; README con instrucciones de entorno limpio. El brief establece que incumplir reproducibilidad deduce en todos los criterios, es el único requisito con efecto multiplicador, así que se trata como restricción de diseño y no como tarea final.
+
+## 5. Plan por día
+
+Antes del evento (pre-work). Confirmar disponibilidad y descargabilidad de las capas de red del ICE; si no están, dejar listo el proxy sintético. Verificar acceso al emulador H2 (credenciales, cuotas, flujo de envío) y probar un envío mínimo. Estas dos verificaciones eliminan los dos riesgos externos que valen puntos y no dependen del equipo.
+
+Día 1, MVP entregable (6-8 h). Datos del ICE (o proxy) vía `build_graph(source)`; construcción de las instancias de 8 y 12 nodos con conteo de qubits registrado; formulación QUBO verificada contra fuerza bruta; implementación de greedy y GW (CVXPY); mapa estático matplotlib; esqueleto del repo reproducible con punto de entrada único y `requirements.txt` pineado. Al cierre del día existe un entregable autónomo completo: problema real, formulación verificada, las tres líneas base clásicas y una visualización.
+
+Día 2, Componente cuántico (6-8 h). QAOA estándar con barrido de p y estadística de ≥5 corridas; warm-start y medición de su efecto contra inicialización estándar; ejecución de la instancia principal en el emulador H2 (con contingencia Guppy → `pytket-quantinuum` de respaldo); instancia grande con criterio de aborto por tiempo; primeras gráficas r vs. p con barras de error.
+
+Día 3, Escalado, informe y pitch (6 h). Análisis de escalado en los 3 tamaños (8/12/16-20) con denominador declarado por tamaño y extrapolación honesta; extensión de restricciones físicas sobre la instancia de 8 nodos si el núcleo está cerrado; informe PDF de ≤8 páginas con sección de limitaciones obligatoria y la nota sobre Tate et al.; mapa interactivo (bonus) y pitch de 5 minutos; declaración de SDK. El mapa interactivo se produce solo después de que informe y escalado estén asegurados.
+
+Roles y paralelización. Como las capas son independientes, el trabajo se divide en frentes paralelos (grafo/datos + líneas base clásicas; núcleo cuántico QAOA + emulador; informe/visualización) para descargar el Día 3, que de otro modo concentra escalado + informe + pitch + mapa en 6 h y es el cuello de botella real. Un retraso en la capa geoespacial no compromete el núcleo, y viceversa.
+
+## 6. Sección de limitaciones (redactada de antemano, porque es obligatoria)
+
+La propuesta declara desde el diseño: (1) QAOA no supera actualmente a Goemans-Williamson para Max-Cut en ninguna instancia, y a p=1 su garantía (0.6924) es estrictamente inferior a la de GW (0.878), nuestros resultados reportan esa brecha con barras de error, no la ocultan; (2) las instancias son simplificaciones agregadas de la red real del ICE (o, si aplica, un proxy sintético documentado como tal), y las aristas de las instancias grandes usan un proxy de conectividad documentado; (3) la razón de aproximación de la instancia grande usa una cota (GW) como denominador, no el óptimo exacto, y se reporta así; (4) los resultados del emulador no equivalen a hardware con ruido real; (5) el efecto del warm-start se reporta gane o no gane, incluyendo el caso en que no mejore al QAOA estándar, y la cita de Tate et al. se acota a contexto teórico, no a promesa de resultado. Esta sección se escribe el día 1 y se completa con números el día 3.
+
+## 7. Por qué esta propuesta gana (mapeo directo a la rúbrica)
+
+Línea base clásica (15%): GW + greedy + fuerza bruta con citas, sobre la misma instancia, nivel Excelente por construcción. Implementación cuántica (30%): QAOA correcto con estadística multi-p y multi-semilla (20%) más ejecución en el emulador H2 con acceso verificado de antemano (10%), y el warm-start cuenta como extensión que "suma positivamente". Comparación y escalado (20%): comparación directa cuántico-clásico en la misma instancia y escalado medido en tres tamaños con denominador declarado y extrapolación honesta. Impacto ODS (5%): datos reales del ICE (o proxy documentado) con cadena causal articulada hacia ODS 7, 9 y 13, más cargas críticas y porcentaje renovable por isla. Reproducibilidad (10%): punto de entrada único con versiones pineadas desde el día 1, blindando además todos los demás criterios contra la deducción por contagio. Explicación (20%): la distinción adyacencia-vs-topología, la consistencia física de las islas, el presupuesto de qubits y el framing honesto del warm-start dan al equipo una narrativa técnica defendible ante cualquier pregunta de jueces o especialistas en potencia. Y frente a las red flags oficiales: cero afirmaciones de ventaja cuántica, limitaciones escritas desde el día 1, estadística en lugar de cherry-picking, y código que corre limpio.
+
+## 8. Referencias
+
+Farhi, Goldstone y Gutmann (2014), arXiv:1411.4028 (QAOA). Goemans y Williamson (1995), JACM 42(6) (línea base SDP). Egger, Mareček y Woerner, "Warm-starting quantum optimization", Quantum 5, 479 (2021). Tate et al., Quantum 7, 1121 (2023) (contexto teórico del warm-start con mixers, citado con sus supuestos y separando garantía teórica de resultado computacional). Lucas, "Ising formulations of many NP problems", Frontiers in Physics 2:5 (2014). Blekos et al. (2024), survey de QAOA. Datos: Instituto Costarricense de Electricidad, portal de datos abiertos (datos-ice-se.opendata.arcgis.com). Herramientas: pytket/guppylang, CVXPY, NetworkX, h3-py, Guppy/`pytket-quantinuum`/emulador H2 de Quantinuum (verificar APIs vigentes en documentación oficial).
