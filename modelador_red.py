@@ -5,12 +5,12 @@ ES: Construye el grafo de transmision 230 kV del ICE desde los CSV oficiales,
     extrae tres instancias NISQ verificadas (MVP-8 / STD-12 / LARGE-16),
     formula el Max-Cut restringido como QUBO e Ising, calcula lineas base
     clasicas y exporta un JSON por instancia para el equipo cuantico
-    (Guppy / emulador Quantinuum H2, 1 nodo del grafo = 1 qubit).
+    (
 EN: Builds the ICE 230 kV transmission graph from the official CSVs,
     extracts three verified NISQ instances (MVP-8 / STD-12 / LARGE-16),
     formulates the constrained Max-Cut as QUBO and Ising, computes classical
     baselines, and exports one JSON bundle per instance for the quantum team
-    (Guppy / Quantinuum H2 emulator, 1 graph node = 1 qubit).
+ 
 
 Modulos / Modules (M1 -> M11 desde main() / from main()):
     M1  Configuracion / Config (dataclass congelada, argparse)
@@ -28,11 +28,7 @@ Modulos / Modules (M1 -> M11 desde main() / from main()):
 Uso / Usage:
     python3 modelador_red.py --data-dir /ruta/csvs --out-dir /ruta/salida
 
-Nota de procedencia / Provenance note:
-ES: Los CSV NO contienen generacion, demanda ni limites termicos. Todo B_i es
-    sintetico ("synthetic": true). Los pesos son un proxy 1/longitud, no MW.
-EN: The CSVs contain NO generation, demand, or thermal ratings. Every B_i is
-    synthetic ("synthetic": true). Weights are a 1/length proxy, not MW.
+
 """
 
 from __future__ import annotations
@@ -52,9 +48,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import matplotlib
-
-# ES: Backend sin pantalla; debe ir antes de pyplot.
-# EN: Headless backend; must precede pyplot import.
+.
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -62,13 +56,12 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
-# ES: Dependencias opcionales: degradan con warning, nunca detienen el pipeline.
-# EN: Optional dependencies: degrade with a warning, never crash the pipeline.
+
 try:  # Goemans-Williamson SDP (M7 Track A iii)
     import cvxpy as cp
 
     CVXPY_AVAILABLE = True
-except ImportError:  # pragma: no cover - depende del entorno / env dependent
+except ImportError: 
     cp = None  # type: ignore[assignment]
     CVXPY_AVAILABLE = False
 
@@ -76,26 +69,20 @@ try:  # Capa geoespacial H3 / H3 geospatial layer (M8)
     import h3
 
     H3_AVAILABLE = True
-except ImportError:  # pragma: no cover - depende del entorno / env dependent
+except ImportError:  
     h3 = None  # type: ignore[assignment]
     H3_AVAILABLE = False
 
 logger = logging.getLogger("isla_verde.modelador_red")
 
-# ES: Radio esferico Web Mercator (EPSG:3857) en metros, para la inversion.
-# EN: Web Mercator (EPSG:3857) sphere radius in meters, for the inversion.
+
 MERCATOR_R = 6378137.0
 
 # ---------------------------------------------------------------------------
 # M1 - Configuracion / Configuration
 # ---------------------------------------------------------------------------
 
-# ES: Instancias NISQ con conectividad verificada (2026-07-20). STD-12 es el
-#     conjunto CORREGIDO: incluye San Miguel (puente hacia {Tejar, El Este})
-#     y NO Anonos, que no tiene circuitos a 230 kV.
-# EN: Connectivity-verified NISQ tiers (2026-07-20). STD-12 is the CORRECTED
-#     set: it contains San Miguel (bridge to {Tejar, El Este}) and NOT Anonos,
-#     which has zero 230 kV circuits.
+
 DEFAULT_INSTANCES: Mapping[str, tuple[str, ...]] = {
     "mvp8": (
         "Arenal", "Cañas", "Garabito", "Barranca",
@@ -137,11 +124,6 @@ FALLBACK_PARALLEL_LENGTHS_M: tuple[float, float] = (5860.3, 5973.5)
 
 @dataclass(frozen=True)
 class Config:
-    """ES: Configuracion inmutable; toda aleatoriedad fluye por un RNG con
-    `seed`; alpha/beta en None activan autocalibracion.
-    EN: Immutable run config; all randomness flows through one RNG seeded
-    with `seed`; alpha/beta of None trigger auto-calibration."""
-
     data_dir: Path = Path("/workspace/knowledge/")
     out_dir: Path = Path("/workspace/scratch/")
     seed: int = 42
@@ -187,12 +169,7 @@ def normalize_name(s: str) -> str:
 
 
 def build_name_map(official_names: Iterable[str]) -> dict[str, str]:
-    """ES: Mapa normalizado -> oficial, mas alias sin articulo: cada clave
-    'la X' se registra tambien como 'X' ('Garita-Lindora' -> 'La Garita').
-    Un alias nunca sobreescribe una clave real; las colisiones se loguean.
-    EN: Map normalized -> official name, plus dropped-article aliases: every
-    'la X' key is also registered under 'X'. An alias never overwrites a
-    genuine key; collisions are logged."""
+  
     name_map: dict[str, str] = {}
     for official in official_names:
         key = normalize_name(official)
@@ -217,8 +194,7 @@ def build_name_map(official_names: Iterable[str]) -> dict[str, str]:
 
 
 class SkipReason(str, Enum):
-    """ES: Razones tipadas de exclusion de un circuito.
-    EN: Typed reasons a circuit row is excluded from the graph."""
+    
 
     NO_HYPHEN = "no-hyphen"
     UNKNOWN_ENDPOINT = "unknown-endpoint"
@@ -226,10 +202,7 @@ class SkipReason(str, Enum):
 
 @dataclass(frozen=True)
 class CircuitResolution:
-    """ES: Resultado de resolver un circuito; las exclusiones son datos
-    (estado + extremos desconocidos), no prints.
-    EN: Outcome of resolving one circuit string; exclusions are data
-    (status + unknown endpoints), not print statements."""
+
 
     raw: str
     status: str  # "ok" o/or valor de SkipReason / SkipReason value
@@ -238,12 +211,7 @@ class CircuitResolution:
 
 
 def parse_circuit(raw: str, name_map: Mapping[str, str]) -> CircuitResolution:
-    """ES: Resuelve 'ExtremoA-ExtremoB' a nombres oficiales. Prueba cada
-    guion (defensivo ante guiones internos) y acepta el primer corte donde
-    ambos extremos resuelven; los fallos se clasifican con el mejor intento.
-    EN: Resolves 'EndpointA-EndpointB' to official names. Tries every hyphen
-    position (defensive against in-name hyphens) and accepts the first split
-    where both endpoints resolve; failures are classified with best attempt."""
+    
     raw = str(raw).strip()
     if "-" not in raw:
         return CircuitResolution(raw=raw, status=SkipReason.NO_HYPHEN.value)
@@ -271,10 +239,7 @@ def parse_circuit(raw: str, name_map: Mapping[str, str]) -> CircuitResolution:
 
 
 def normalize_province(s: str) -> str:
-    """ES: Provincia sin tildes y en Title Case: evita provincias fantasma en
-    la leyenda ('San Jose'/'San José' -> 'San Jose').
-    EN: Accent-stripped, title-cased province key: prevents phantom provinces
-    in the legend and color keying."""
+  
     s = str(s).strip().lower()
     s = unicodedata.normalize("NFD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
@@ -283,18 +248,15 @@ def normalize_province(s: str) -> str:
 
 
 def mercator_to_latlon(x: float, y: float) -> tuple[float, float]:
-    """ES: Invierte EPSG:3857 (metros) a (lat, lon) en grados. X/Y del CSV
-    son METROS, no grados: pasarlos crudos a h3 produce basura.
-    EN: Inverts EPSG:3857 meters to (lat, lon) degrees. The CSV X/Y columns
-    are METERS, not degrees: feeding them raw into h3 produces garbage."""
+    
     lon = math.degrees(x / MERCATOR_R)
     lat = math.degrees(math.atan(math.sinh(y / MERCATOR_R)))
     return lat, lon
 
 
 # ---------------------------------------------------------------------------
-# M6 - Algebra QUBO/Ising (funciones puras, una sola fuente de verdad)
-# M6 - QUBO/Ising algebra (pure functions, one source of truth)
+# M6 - Algebra QUBO/Ising 
+# M6 - QUBO/Ising algebra 
 # ---------------------------------------------------------------------------
 
 
@@ -306,13 +268,7 @@ def build_qubo(
     critical_idx: int,
     anchor_idx: int,
 ) -> tuple[np.ndarray, float]:
-    """ES: Ensambla H_total = H_cut + alpha*H_balance + beta*H_critical como
-    matriz Q triangular superior mas offset constante rastreado, tal que
-    E(x) = x^T Q x + offset para x binario (la diagonal actua lineal,
-    x_i^2 = x_i). W_ij = 1e5/longitud es un proxy de acople, no MW.
-    EN: Assembles H_total as an upper-triangular QUBO matrix Q plus a tracked
-    constant offset, so E(x) = x^T Q x + offset for binary x (diagonal acts
-    linearly, x_i^2 = x_i). W_ij = 1e5/length is a coupling proxy, not MW."""
+
     n = balances.shape[0]
     q_matrix = np.zeros((n, n), dtype=np.float64)
 
@@ -352,8 +308,7 @@ def build_qubo(
     q_matrix[g, g] += beta
     q_matrix[lo, hi] -= 2.0 * beta
 
-    # ES: No surge termino constante; se rastrea igual, nunca se descarta.
-    # EN: No constant term arises; tracked anyway, never silently dropped.
+  
     offset = 0.0
     return q_matrix, offset
 
@@ -361,12 +316,7 @@ def build_qubo(
 def qubo_to_ising(
     q_matrix: np.ndarray, qubo_offset: float
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """ES: Deriva (h, J_upper, offset) desde Q via x_i = (1 - s_i)/2. Una sola
-    fuente de verdad: el Ising es transformacion mecanica de Q, nunca se
-    rederiva de la fisica; el offset se rastrea explicitamente.
-    EN: Derives (h, J_upper, offset) from Q via x_i = (1 - s_i)/2. Single
-    source of truth: the Ising form is a mechanical transform of Q, never
-    re-derived from the physics; the offset is tracked explicitly."""
+    
     diag = np.diag(q_matrix).copy()
     upper = np.triu(q_matrix, k=1)
     # x_i = (1 - s_i)/2 ; x_i x_j = (1 - s_i - s_j + s_i s_j)/4
@@ -395,12 +345,7 @@ def ising_energies(
 
 
 def enumerate_bitstrings(n_vars: int, fix_first_zero: bool = False) -> np.ndarray:
-    """ES: Todas las asignaciones binarias como arreglo (2^k, n); variable 0
-    es el LSB. fix_first_zero explota la simetria del corte (complementar
-    todo x no cambia ningun corte): enumera 2^(n-1) con x_0 = 0.
-    EN: All binary assignments as a (2^k, n) array; variable 0 = LSB.
-    fix_first_zero exploits cut symmetry (global complement preserves any
-    cut): enumerates 2^(n-1) states with x_0 = 0."""
+ 
     free = n_vars - 1 if fix_first_zero else n_vars
     ints = np.arange(1 << free, dtype=np.uint64)
     bits = ((ints[:, None] >> np.arange(free, dtype=np.uint64)[None, :]) & 1)
@@ -441,8 +386,7 @@ class CalibrationError(RuntimeError):
 
 @dataclass
 class InstanceModel:
-    """ES: Todo lo que el equipo cuantico necesita de una instancia NISQ.
-    EN: Everything the quantum team needs about one NISQ instance."""
+   
 
     tier: str
     variable_order: list[str]
@@ -464,8 +408,7 @@ class InstanceModel:
 
 
 class ICEPowerGridModeler:
-    """ES: Pipeline completo M1 -> M11 del entregable Fase 1 de ISLA VERDE.
-    EN: End-to-end M1 -> M11 pipeline for the ISLA VERDE Phase 1 deliverable."""
+
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -483,8 +426,7 @@ class ICEPowerGridModeler:
     # -- M2/M3 ----------------------------------------------------------------
 
     def load_data(self) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-        """ES: Lee ambos CSV; retorna None para activar el protocolo fallback.
-        EN: Reads both CSVs; returns None to trigger the fallback protocol."""
+        
         subs_path = self.cfg.data_dir / self.cfg.subs_filename
         lines_path = self.cfg.data_dir / self.cfg.lines_filename
         try:
@@ -595,10 +537,6 @@ class ICEPowerGridModeler:
         self._check_graph_invariants()
 
     def _check_graph_invariants(self) -> None:
-        """ES: Invariantes suaves verificados en el dataset actual (M3):
-        warning si hay deriva, nunca crash (los archivos pueden cambiar).
-        EN: Soft invariants verified on the current dataset (M3): warn on
-        drift, never crash (the upstream files may legitimately change)."""
         graph = self.graph
         n_nodes, n_edges = graph.number_of_nodes(), graph.number_of_edges()
         connected = nx.is_connected(graph) if n_nodes else False
@@ -625,10 +563,7 @@ class ICEPowerGridModeler:
                             "soft", ok, detail))
 
     def build_fallback_graph(self) -> None:
-        """ES: Protocolo fallback: proxy sintetico MVP-8 con longitudes reales;
-        Lindora-La Caja como SUMA de los dos pesos individuales.
-        EN: Fallback protocol: synthetic MVP-8 proxy with real measured
-        lengths; Lindora-La Caja as the SUM of the two individual weights."""
+      
         logger.warning("[FALLBACK] Using synthetic ICE 230 kV corridor proxy")
         self.source = "fallback"
         cfg = self.cfg
@@ -649,10 +584,7 @@ class ICEPowerGridModeler:
                     circuits=[f"{u}-{v}"], lengths_m=[length_m],
                     parallel=False, length_m=length_m,
                 )
-        # ES: Sin coordenadas ni provincias reales: layout con semilla solo
-        #     para graficar; todo campo geografico queda marcado sintetico.
-        # EN: No real coordinates or provinces: seeded layout for plotting
-        #     only; every geographic field is flagged synthetic.
+      
         pos = nx.spring_layout(graph, seed=cfg.seed)
         for node in graph.nodes:
             graph.nodes[node]["province"] = "Sintetica"
@@ -667,13 +599,7 @@ class ICEPowerGridModeler:
     # -- M4 -------------------------------------------------------------------
 
     def extract_instances(self) -> dict[str, nx.Graph]:
-        """ES: Subgrafos inducidos por nivel. La conectividad aqui es asercion
-        DURA: los conjuntos son parte del spec verificado, una desconexion
-        significa que el procesamiento previo se rompio. Nodos sin resolver
-        omiten la instancia con sugerencias difflib; las demas continuan.
-        EN: Induced subgraphs per tier. Connectivity is a HARD assertion: the
-        node sets are spec-verified, so a disconnection means upstream broke.
-        Unresolvable nodes skip the instance with difflib suggestions."""
+        
         subgraphs: dict[str, nx.Graph] = {}
         for tier, node_set in self.cfg.instances.items():
             missing = [n for n in node_set if n not in self.graph]
@@ -705,25 +631,7 @@ class ICEPowerGridModeler:
     # -- M5 -------------------------------------------------------------------
 
     def assign_balances(self, nodes: Sequence[str]) -> dict[str, float]:
-        """ES: Balances sinteticos deterministas B_i = G_i - D_i con
-        sum B_i == 0 exacto. Los CSV no traen MW, asi que los valores son
-        sinteticos por necesidad. Arenal y Garabito son anclas de generacion,
-        estilizadas segun los sitios hidro (complejo Arenal) y termico
-        (planta Garabito) reales del ICE: la UBICACION es realista, los
-        VALORES son ilustrativos y todo export lleva "synthetic": true.
-        Cargas desde el unico RNG; la generacion reparte la carga total por
-        cuotas; el residuo flotante se absorbe en la ultima carga para suma
-        exactamente cero (garantiza biparticion balanceada factible y hace
-        correcta la penalizacion unilateral de H_balance).
-        EN: Deterministic synthetic balances B_i = G_i - D_i with exact
-        sum B_i == 0. The CSVs carry no MW, so values are synthetic by
-        necessity. Arenal and Garabito are generation anchors, stylized after
-        ICE's real hydro (Arenal complex) and thermal (Garabito plant) sites:
-        the SITING is realistic, the VALUES are illustrative; every export
-        carries "synthetic": true. Loads come from the single RNG; generation
-        splits total load by shares; the float residual is folded into the
-        last load node so the sum is exactly zero (guarantees a feasible
-        balanced bipartition and makes the one-sided H_balance correct)."""
+      
         anchors = [a for a in self.cfg.generator_anchors if a in nodes]
         if not anchors:
             raise ValueError(
@@ -752,22 +660,7 @@ class ICEPowerGridModeler:
     # -- M6 -------------------------------------------------------------------
 
     def formulate_instance(self, tier: str, subgraph: nx.Graph) -> InstanceModel:
-        """ES: QUBO/Ising con penalizaciones autocalibradas (requisitos, no
-        numeros magicos):
-          beta >= 2*sum W_ij -> violar la restriccion critica nunca conviene
-              frente a cualquier ganancia de corte posible.
-          alpha = sum W / Var[sum B_i x_i] con x uniforme. Con x_i iid
-              Bernoulli(1/2), Var = sum B_i^2 / 4 (analitico), asi que
-              alpha = 4*sum(W)/sum(B^2).
-        Lazo de verificacion: fuerza bruta del optimo de H_total y asercion
-        x_c == x_g; si falla, duplicar beta y reresolver, maximo 3 veces;
-        si persiste, abortar con reporte diagnostico.
-        EN: QUBO/Ising with auto-calibrated penalties (requirements, not
-        magic numbers): beta >= 2*sum W so violating the critical constraint
-        never pays off; alpha = sum W / Var[sum B x] under uniform x =
-        4*sum(W)/sum(B^2) analytically. Verification loop: brute-force the
-        H_total optimum, assert x_c == x_g; on violation double beta, at most
-        3 times; if still violated, abort with a diagnostic report."""
+       
         cfg = self.cfg
         # ES: Orden fijo = nombres ordenados, registrado en el export.
         # EN: Fixed order = sorted node names, recorded in the export.
@@ -857,16 +750,7 @@ class ICEPowerGridModeler:
     # -- M7 -------------------------------------------------------------------
 
     def compute_baselines(self, model: InstanceModel) -> None:
-        """ES: Lineas base clasicas sobre la misma instancia exacta.
-        Track A (Max-Cut puro): fuerza bruta exacta (x_0 = 0 por simetria),
-        greedy con flips de un nodo, Goemans-Williamson SDP con 50 redondeos
-        sembrados. Track B (H_total completo): minimo exacto y bitstring
-        argmin, el E_opt de referencia del equipo cuantico.
-        EN: Classical baselines on the exact same instance. Track A (pure
-        Max-Cut): exact brute force (x_0 = 0 by symmetry), greedy single-flip
-        local search, GW SDP with 50 seeded roundings. Track B (full
-        H_total): exact minimum energy and argmin bitstring, the quantum
-        team's reference E_opt."""
+     
         n_vars = len(model.variable_order)
         edges = model.edges_idx
 
@@ -909,14 +793,7 @@ class ICEPowerGridModeler:
     def _greedy_maxcut(
         self, edges: Sequence[tuple[int, int, float]], n_vars: int
     ) -> tuple[float, np.ndarray]:
-        """ES: Inicio aleatorio + flips de un nodo hasta optimo local.
-        Voltear i alterna el estado de corte de cada arista incidente:
-        gain_i = sum_{j vecino} W_ij * (+1 si x_i == x_j, -1 si no).
-        Se canoniza a x_0 = 0 (el complemento global preserva el corte).
-        EN: Random start + single-node flips to a local optimum. Flipping i
-        toggles the cut status of every incident edge:
-        gain_i = sum_{j in N(i)} W_ij * (+1 if x_i == x_j else -1).
-        Canonicalized to x_0 = 0 (global complement preserves cuts)."""
+        
         x = self.rng.integers(0, 2, size=n_vars).astype(np.float64)
         incident: list[list[tuple[int, float]]] = [[] for _ in range(n_vars)]
         for i, j, w in edges:
@@ -941,14 +818,7 @@ class ICEPowerGridModeler:
         self, edges: Sequence[tuple[int, int, float]], n_vars: int,
         roundings: int,
     ) -> dict[str, Any] | None:
-        """ES: Relajacion SDP de GW + redondeos por hiperplanos sembrados.
-        Retorna None (el export lleva null) si cvxpy o su solver falla: una
-        dependencia opcional nunca detiene el pipeline. La garantia 0.878 es
-        en esperanza, se chequea abajo como warning suave.
-        EN: GW SDP relaxation + seeded random-hyperplane roundings. Returns
-        None (export carries null) if cvxpy or its solver fails: an optional
-        dependency never crashes the pipeline. The 0.878 guarantee holds in
-        expectation only; checked downstream as a soft warning."""
+       
         if not CVXPY_AVAILABLE:
             logger.warning(
                 "cvxpy no disponible / unavailable: GW baseline = null"
@@ -999,15 +869,7 @@ class ICEPowerGridModeler:
     # -- M8 -------------------------------------------------------------------
 
     def build_h3_layer(self) -> dict[str, Any] | None:
-        """ES: Propuesta H3 opcional para escalar mas alla de 26 qubits.
-        Regla de oro aplicada aqui: la adyacencia de celdas H3 NO es conexion
-        electrica; las aristas entre supernodos derivan EXCLUSIVAMENTE de
-        lineas fisicas 230 kV con extremos en celdas distintas. Esta capa
-        nunca afecta el pipeline principal.
-        EN: Optional H3 proposal for scaling beyond 26 qubits. Golden rule
-        enforced here: H3 cell adjacency is NOT electrical connection;
-        supernode edges derive EXCLUSIVELY from physical 230 kV lines whose
-        endpoints fall in different cells. Never affects the main pipeline."""
+       
         if not H3_AVAILABLE:
             logger.warning("h3 no disponible / unavailable: capa omitida / skipped")
             return None
@@ -1089,8 +951,7 @@ class ICEPowerGridModeler:
     # -- M9 -------------------------------------------------------------------
 
     def export(self, h3_layer: dict[str, Any] | None) -> list[Path]:
-        """ES: Escribe los JSON por instancia, el grafo completo y un indice.
-        EN: Writes per-instance JSON bundles, the full graph, and an index."""
+       
         out_dir = self.cfg.out_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         generated_utc = datetime.now(timezone.utc).isoformat()
@@ -1160,9 +1021,7 @@ class ICEPowerGridModeler:
             written.append(path)
             logger.info("Exportado / exported %s", path)
 
-        # ES: Grafo completo como node-link de NetworkX (kwarg protegido entre
-        #     versiones). / EN: Full graph as NetworkX node-link data (kwarg
-        #     guarded across versions).
+      
         export_graph = nx.Graph()
         for node, data in self.graph.nodes(data=True):
             export_graph.add_node(node, **{
@@ -1219,13 +1078,7 @@ class ICEPowerGridModeler:
     # -- M10 ------------------------------------------------------------------
 
     def visualize(self) -> Path:
-        """ES: Figura estatica del grafo completo en coordenadas Mercator.
-        Nodos coloreados por provincia normalizada; ancho de arista
-        proporcional al peso normalizado con tope (la regla 1/longitud abarca
-        ordenes de magnitud); miembros de instancias contorneados y etiquetados.
-        EN: Static full-graph figure on Mercator coordinates. Nodes colored by
-        normalized province; edge width proportional to normalized weight with
-        a hard cap; instance-member nodes outlined and labeled."""
+        
         graph = self.graph
         positions = {
             n: (d["x_merc"], d["y_merc"]) for n, d in graph.nodes(data=True)
@@ -1295,12 +1148,7 @@ class ICEPowerGridModeler:
     # -- M11 ------------------------------------------------------------------
 
     def run_verification(self) -> bool:
-        """ES: Suite de autoverificacion. Imprime la tabla PASS/FAIL (unico
-        uso permitido de print) y retorna el exito de los checks duros.
-        EN: Self-verification suite. Prints the PASS/FAIL table (the only
-        sanctioned use of print) and returns overall hard-check success."""
-        # ES: El check 8 se registro durante la construccion del grafo.
-        # EN: Check 8 was recorded during graph construction.
+      
         checks = self.checks
 
         for tier, model in self.instances.items():
