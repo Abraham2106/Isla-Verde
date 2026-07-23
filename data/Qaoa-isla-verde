@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""ISLA VERDE - Fase cuantica COMPLETA en un unico archivo.
+
+PUNTO DE ENTRADA UNICO (requisito de reproducibilidad de la rubrica):
+reproduce cada figura y cada cifra reportada del lado cuantico, y encadena
+las etapas clasicas invocando los scripts que ya existen en el repo.
+
+Contenido (todo en este archivo):
+    1. Carga de instancias desde los JSON de 'modelador_red.py'.
+    2. Circuito QAOA de p capas construido con pytket desde el Ising (h, J).
+    3. Backend conmutable: local (Qulacs, gratis) o H2 (emulador Quantinuum
+       via qnexus), elegido por linea de comandos.
+    4. Optimizacion clasica de angulos (COBYLA por defecto, BFGS opcional).
+    5. Multiples ejecuciones con distintas inicializaciones -> media y
+       desviacion estandar (la rubrica exige >= 5).
+    6. Barrido de p y figura obligatoria "razon de aproximacion vs p" con
+       barras de error.
+    7. Orquestacion de las etapas clasicas (modelador_red.py y
+       comparar_qaoa.py) para reproducir todo de un tiron.
+
+Alineacion con la rubrica del Challenge 1:
+    - Se reporta la RAZON DE APROXIMACION (r = corte/optimo), nunca el
+      costo bruto.
+    - Se reporta MEDIA +/- DESVIACION ESTANDAR sobre n_runs ejecuciones.
+      La cifra que se pasa a la comparacion es la MEDIA, no la mejor
+      corrida: la rubrica marca el "cherry-picking de la mejor ejecucion"
+      como red flag. El mejor valor se conserva solo como dato secundario.
+    - Se soporta escalado de p (multiples valores de p).
+    - Optimizador alternativo (BFGS) disponible si COBYLA no converge.
+    - Consistencia max/min: se maximiza el corte minimizando su negativo.
+
+Limitacion honesta que debe acompanar todo reporte de estos resultados:
+    QAOA no supera a Goemans-Williamson para Max-Cut en ninguna instancia
+    conocida; para p=1 la garantia teorica (0.6924) es estrictamente
+    inferior a la de GW (0.878). Ademas, los balances de potencia B_i son
+    sinteticos (los CSV del ICE no traen MW) y el peso 1/longitud es un
+    proxy de acoplamiento, no una capacidad electrica real.
+
+Uso:
+    python3 isla_verde_cuantico.py                          # todo, local
+    python3 isla_verde_cuantico.py --backend h2             # QAOA en H2
+    python3 isla_verde_cuantico.py --solo-cuantico          # sin etapa 1
+    python3 isla_verde_cuantico.py --tiers mvp8 --p-values 1 2 --n-runs 5
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from scipy.optimize import minimize
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from pytket import Circuit
+
+logger = logging.getLogger("isla_verde.cuantico")
+
+# Cotas teoricas citadas por la rubrica.
+GW_GUARANTEE = 0.878        # Goemans & Williamson (1995), JACM 42(6)
+QAOA_P1_GUARANTEE = 0.6924  # Farhi, Goldstone & Gutmann (2014)
+
+# Backend por defecto; se sobreescribe con --backend.
+BACKEND = "local"
+EMULATOR_NAME = "H2-1E"        # nombre del emulador en Nexus (ajustar)
+NEXUS_PROJECT = "isla-verde"   # nombre del proyecto Nexus (ajustar)
+
+
+# ===========================================================================
+# 1. Carga de la instancia (JSON producido por modelador_red.py)
+# ===========================================================================
+def cargar_instancia(scratch_dir: Path, tier: str) -> dict[str, Any] | None:
+    """Lee isla_verde_{tier}.json y devuelve variable_order, h, J_upper,
+    edges y el optimo exacto de fuerza bruta. None con warning si falta."""
+    path = scratch_dir / f"isla_verde_{tier}.json"
+    if not path.exists():
+        logger.warning("[%s] no se encontro %s. Corre primero la etapa "
+                       "clasica (modelador_red.py --out-dir %s)",
+                       tier, path, scratch_dir)
+        return None
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    try:
+        variable_order = payload["variable_order"]
+        h = np.array(payload["ising"]["h"], dtype=np.float64)
+        j_upper = np.array(payload["ising"]["J_upper"], dtype=np.float64)
+        edges = payload["edges"]
+        optimum = float(payload["baselines"]["maxcut"]["brute_force"]["cut"])
+    except KeyError as exc:
+        logger.warning("[%s] %s no tiene el campo esperado %s", tier, path, exc)
+        return None
+
+    return {"tier": tier, "variable_order": variable_order, "h": h,
+            "J_upper": j_upper, "edges": edges, "optimum": optimum,
+            "n": len(variable_order)}
+
+
+# ===========================================================================
+# 2. Corte ponderado de un bitstring (misma definicion que la Fase 1)
+# ===========================================================================
+def valor_corte(edges: list[dict], bits: dict[str, int]) -> float:
+    """Suma de pesos de las aristas cuyos extremos caen en islas distintas.
+    Identica a la usada por greedy y GW, para que los numeros sean
+    directamente comparables. NO es la energia del Ising."""
+    total = 0.0
+    for arista in edges:
+        u, v, w = arista["u"], arista["v"], float(arista["weight"])
+        if bits[u] != bits[v]:
+            total += w
+    return total
+
+
+# ===========================================================================
+# 3. Circuito QAOA de p capas desde el Hamiltoniano Ising
+# ===========================================================================
+def construir_circuito_qaoa(n: int, h: np.ndarray, j_upper: np.ndarray,
+                             gammas: np.ndarray, betas: np.ndarray) -> Circuit:
+    """QAOA de p capas. Por cada capa k:
+        Hamiltoniano de costo (gamma_k):
+            campo local h_i -> Rz(2*gamma_k*h_i)
+            acople J_ij     -> CX(i,j) . Rz(2*gamma_k*J_ij) . CX(i,j)
+        Hamiltoniano de mezcla (beta_k): Rx(2*beta_k) en cada qubit.
+    Antes: Hadamard en todos (superposicion uniforme). Al final: medicion.
+    Los angulos de pytket van en unidades de PI, de ahi la division."""
+    p = len(gammas)
+    circ = Circuit(n, n)
+
+    for q in range(n):
+        circ.H(q)
+
+    for k in range(p):
+        gamma, beta = float(gammas[k]), float(betas[k])
+        for i in range(n):
+            if abs(h[i]) > 1e-12:
+                circ.Rz(2.0 * gamma * h[i] / np.pi, i)
+        for i in range(n):
+            for j in range(i + 1, n):
+                jij = j_upper[i, j]
+                if abs(jij) > 1e-12:
+                    circ.CX(i, j)
+                    circ.Rz(2.0 * gamma * jij / np.pi, j)
+                    circ.CX(i, j)
+        for q in range(n):
+            circ.Rx(2.0 * beta / np.pi, q)
+
+    for q in range(n):
+        circ.Measure(q, q)
+
+    return circ
+
+
+# ===========================================================================
+# 4. Backend: local (Qulacs) o H2 (emulador Quantinuum via qnexus)
+# ===========================================================================
+def obtener_backend():
+    """Devuelve (backend, etiqueta) segun la variable global BACKEND."""
+    if BACKEND == "local":
+        from pytket.extensions.qulacs import QulacsBackend
+        logger.info("Backend LOCAL: QulacsBackend (simulador, sin costo)")
+        return QulacsBackend(), "local-qulacs"
+
+    if BACKEND == "h2":
+        import qnexus as qnx
+        from pytket.extensions.quantinuum import QuantinuumBackend
+        logger.info("Backend H2: %s via qnexus (proyecto %s)",
+                    EMULATOR_NAME, NEXUS_PROJECT)
+        qnx.projects.get_or_create(name=NEXUS_PROJECT)
+        backend = QuantinuumBackend(device_name=EMULATOR_NAME)
+        backend.login()
+        return backend, f"h2-{EMULATOR_NAME}"
+
+    raise ValueError(f"BACKEND desconocido: {BACKEND!r} (usar 'local' o 'h2')")
+
+
+# ===========================================================================
+# 5. Evaluacion de un vector de angulos
+# ===========================================================================
+def evaluar_angulos(params: np.ndarray, instancia: dict, backend, shots: int,
+                    p: int) -> tuple[float, float, dict[str, int]]:
+    """Corre el circuito con los angulos dados (primeros p = gammas,
+    ultimos p = betas) y devuelve (corte_promedio, mejor_corte,
+    mejor_bitstring)."""
+    n = instancia["n"]
+    variable_order = instancia["variable_order"]
+    edges = instancia["edges"]
+    gammas, betas = params[:p], params[p:]
+
+    circ = construir_circuito_qaoa(n, instancia["h"], instancia["J_upper"],
+                                    gammas, betas)
+    circ = backend.get_compiled_circuit(circ)
+    counts = backend.run_circuit(circ, n_shots=shots).get_counts()
+
+    suma, total = 0.0, 0
+    mejor_corte, mejor_bits = -np.inf, {}
+    for lectura, veces in counts.items():
+        bits = {variable_order[q]: int(lectura[q]) for q in range(n)}
+        corte = valor_corte(edges, bits)
+        suma += corte * veces
+        total += veces
+        if corte > mejor_corte:
+            mejor_corte, mejor_bits = corte, bits
+
+    return (suma / total if total else 0.0), mejor_corte, mejor_bits
+
+
+# ===========================================================================
+# 6. Una ejecucion: optimizacion de angulos desde un arranque dado
+# ===========================================================================
+def una_ejecucion(instancia: dict, backend, shots: int, p: int,
+                  optimizer: str, x0: np.ndarray) -> dict[str, Any]:
+    """Optimizacion completa desde x0. Como scipy minimiza, se minimiza el
+    negativo del corte = maximizar (consistencia max/min)."""
+    mejor = {"corte": -np.inf, "bits": {}, "params": None}
+
+    def objetivo(params: np.ndarray) -> float:
+        _, corte_ind, bits = evaluar_angulos(params, instancia, backend,
+                                              shots, p)
+        if corte_ind > mejor["corte"]:
+            mejor.update(corte=corte_ind, bits=bits, params=params.copy())
+        return -corte_ind
+
+    if optimizer.upper() == "BFGS":
+        minimize(objetivo, x0, method="BFGS", options={"maxiter": 40})
+    else:
+        minimize(objetivo, x0, method="COBYLA",
+                 options={"maxiter": 40, "rhobeg": 0.5})
+
+    ratio = (mejor["corte"] / instancia["optimum"]
+             if instancia["optimum"] > 0 else float("nan"))
+    return {"cut": float(mejor["corte"]), "ratio": float(ratio),
+            "bits": mejor["bits"]}
+
+
+# ===========================================================================
+# 7. n_runs ejecuciones con distintas inicializaciones -> estadistica
+# ===========================================================================
+def resolver_instancia(instancia: dict, backend, shots: int, p: int,
+                       n_runs: int, optimizer: str, seed: int) -> dict[str, Any]:
+    """Corre n_runs optimizaciones independientes con arranques distintos.
+    Reporta media y desviacion estandar (lo que exige la rubrica) y ademas
+    el mejor y el peor, para transparencia."""
+    tier = instancia["tier"]
+    rng = np.random.default_rng(seed)
+
+    ratios, cortes = [], []
+    for run in range(n_runs):
+        x0 = rng.uniform(0.0, np.pi, size=2 * p)
+        res = una_ejecucion(instancia, backend, shots, p, optimizer, x0)
+        ratios.append(res["ratio"])
+        cortes.append(res["cut"])
+        logger.info("[%s] p=%d run %d/%d: cut=%.4f  r=%.4f",
+                    tier, p, run + 1, n_runs, res["cut"], res["ratio"])
+
+    ratios, cortes = np.array(ratios), np.array(cortes)
+    return {
+        "tier": tier, "p": p, "n_runs": n_runs, "optimizer": optimizer,
+        "optimum": instancia["optimum"],
+        # cifra principal reportada (sin cherry-picking)
+        "cut_mean": float(cortes.mean()), "cut_std": float(cortes.std()),
+        "ratio_mean": float(ratios.mean()), "ratio_std": float(ratios.std()),
+        # datos secundarios, solo para transparencia
+        "cut_best": float(cortes.max()), "ratio_best": float(ratios.max()),
+        "ratio_worst": float(ratios.min()),
+    }
+
+
+# ===========================================================================
+# 8. Barrido de p y figura obligatoria "razon vs p"
+# ===========================================================================
+def barrer_p(scratch_dir: Path, tiers: list[str], p_values: list[int],
+             shots: int, n_runs: int, optimizer: str, seed: int
+             ) -> dict[str, list[dict[str, Any]]]:
+    """Para cada instancia y cada p, corre el bloque completo de n_runs
+    ejecuciones. Devuelve {tier: [res_p1, res_p2, ...]}."""
+    backend, etiqueta = obtener_backend()
+    logger.info("Barrido p=%s sobre %s | backend=%s | n_runs=%d | shots=%d",
+                p_values, tiers, etiqueta, n_runs, shots)
+
+    resultados: dict[str, list[dict[str, Any]]] = {}
+    for tier in tiers:
+        instancia = cargar_instancia(scratch_dir, tier)
+        if instancia is None:
+            continue
+        serie = []
+        for p in p_values:
+            logger.info("[%s] p=%d (%d qubits, %d ejecuciones)...",
+                        tier, p, instancia["n"], n_runs)
+            res = resolver_instancia(instancia, backend, shots, p, n_runs,
+                                     optimizer, seed)
+            res["backend"] = etiqueta
+            serie.append(res)
+            print(f"  [{tier}] p={p}: r = {res['ratio_mean']:.4f} "
+                  f"+/- {res['ratio_std']:.4f}   "
+                  f"(mejor {res['ratio_best']:.4f}, peor {res['ratio_worst']:.4f})")
+        resultados[tier] = serie
+    return resultados
+
+
+def graficar_r_vs_p(resultados: dict[str, list[dict[str, Any]]],
+                    out_path: Path) -> Path | None:
+    """Figura obligatoria: razon de aproximacion vs p, con barras de error
+    (desviacion estandar sobre las n_runs ejecuciones) y las cotas teoricas
+    de GW y de QAOA p=1 que cita la rubrica."""
+    if not resultados:
+        logger.warning("Sin resultados: no se genera figura")
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for tier, serie in resultados.items():
+        ps = [r["p"] for r in serie]
+        medias = [r["ratio_mean"] for r in serie]
+        stds = [r["ratio_std"] for r in serie]
+        ax.errorbar(ps, medias, yerr=stds, marker="o", capsize=4,
+                    label=f"{tier} (media +/- desv. est.)")
+
+    ax.axhline(GW_GUARANTEE, color="black", linestyle="--", linewidth=1,
+               label=f"Garantia GW ({GW_GUARANTEE})")
+    ax.axhline(QAOA_P1_GUARANTEE, color="gray", linestyle=":", linewidth=1,
+               label=f"Garantia QAOA p=1 ({QAOA_P1_GUARANTEE})")
+
+    todos_p = sorted({r["p"] for serie in resultados.values() for r in serie})
+    ax.set_xticks(todos_p)
+    ax.set_xlabel("Numero de capas p")
+    ax.set_ylabel("Razon de aproximacion r = corte / optimo")
+    ax.set_title("QAOA: razon de aproximacion vs p - Proyecto Isla Verde")
+    ax.set_ylim(0, 1.05)
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    logger.info("Figura guardada en %s", out_path)
+    return out_path
+
+
+# ===========================================================================
+# 9. Etapas clasicas: se invocan los scripts existentes del repo
+# ===========================================================================
+def ejecutar_script(descripcion: str, comando: list[str]) -> bool:
+    """Corre un script externo mostrando su salida en vivo."""
+    print("\n" + "=" * 70)
+    print(f">>> {descripcion}")
+    print("    " + " ".join(comando))
+    print("=" * 70)
+    if subprocess.run(comando).returncode != 0:
+        print(f"\n[ERROR] Etapa fallida: {descripcion}")
+        return False
+    return True
+
+
+# ===========================================================================
+# 10. Orquestacion completa
+# ===========================================================================
+def run(data_dir: Path, scratch_dir: Path, tiers: list[str],
+        p_values: list[int], shots: int, n_runs: int, optimizer: str,
+        seed: int, solo_cuantico: bool) -> int:
+    py = sys.executable
+
+    # --- Etapa 1 (clasica): grafo, QUBO/Ising, lineas base --------------
+    if not solo_cuantico:
+        if not ejecutar_script(
+            "Etapa 1/3 - Modelado de la red y lineas base clasicas",
+            [py, "modelador_red.py", "--data-dir", str(data_dir),
+             "--out-dir", str(scratch_dir), "--seed", str(seed)],
+        ):
+            return 1
+
+    # --- Etapa 2 (cuantica): barrido de p con estadistica y figura ------
+    print("\n" + "=" * 70)
+    print(">>> Etapa 2/3 - QAOA: barrido de p, estadistica y figura r vs p")
+    print("=" * 70)
+    resultados = barrer_p(scratch_dir, tiers, p_values, shots, n_runs,
+                          optimizer, seed)
+    if not resultados:
+        logger.error("Ninguna instancia disponible en %s", scratch_dir)
+        return 1
+
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    with open(scratch_dir / "qaoa_barrido_p.json", "w", encoding="utf-8") as f:
+        json.dump(resultados, f, indent=2, ensure_ascii=False)
+    graficar_r_vs_p(resultados, scratch_dir / "qaoa_ratio_vs_p.png")
+
+    # Tabla resumen: media +/- std por p (cifra principal de la rubrica).
+    print("\n=== Razon de aproximacion vs p (media +/- desv. estandar) ===")
+    encabezado = f"{'instancia':<12}" + "".join(
+        f"{'p=' + str(p):>24}" for p in p_values)
+    print(encabezado)
+    print("-" * len(encabezado))
+    for tier, serie in resultados.items():
+        fila = f"{tier:<12}"
+        for res in serie:
+            fila += f"{res['ratio_mean']:>15.4f} +/- {res['ratio_std']:<6.4f}"
+        print(fila)
+
+    # JSON para la Fase 2. Se reporta la MEDIA, no la mejor corrida:
+    # la rubrica marca el cherry-picking como red flag.
+    p_reporte = p_values[-1]
+    resultados_fase2 = {}
+    for tier, serie in resultados.items():
+        res = next(r for r in serie if r["p"] == p_reporte)
+        resultados_fase2[tier] = {"cut": res["cut_mean"], "p": p_reporte}
+    ruta_fase2 = scratch_dir / "qaoa_results.json"
+    with open(ruta_fase2, "w", encoding="utf-8") as f:
+        json.dump(resultados_fase2, f, indent=2, ensure_ascii=False)
+    logger.info("Resultados para Fase 2 (media, p=%d) en %s",
+                p_reporte, ruta_fase2)
+
+    # --- Etapa 3 (clasica): comparacion QAOA vs lineas base -------------
+    if not ejecutar_script(
+        "Etapa 3/3 - Comparacion QAOA vs lineas base clasicas",
+        [py, "comparar_qaoa.py", "--scratch-dir", str(scratch_dir),
+         "--tiers", *tiers, "--qaoa-results", str(ruta_fase2)],
+    ):
+        return 1
+
+    # --- Inventario de artefactos ---------------------------------------
+    print("\n" + "=" * 70)
+    print("REPRODUCCION COMPLETA. Artefactos en:", scratch_dir)
+    print("=" * 70)
+    esperados = [
+        "isla_verde_mvp8.json", "isla_verde_std12.json",
+        "isla_verde_large16.json", "isla_verde_full_graph.json",
+        "isla_verde_index.json", "isla_verde_red_230kv.png",
+        "qaoa_barrido_p.json", "qaoa_ratio_vs_p.png",
+        "qaoa_results.json", "comparacion_qaoa_vs_clasico.png",
+    ]
+    for nombre in esperados:
+        marca = "OK" if (scratch_dir / nombre).exists() else "--"
+        print(f"  [{marca}] {nombre}")
+
+    print("\nRecordatorio para el informe (limitaciones honestas):")
+    print("  - QAOA no supera a GW para Max-Cut; en p=1 su garantia (0.6924)")
+    print("    es inferior a la de GW (0.878).")
+    print("  - Los balances B_i son sinteticos: los CSV del ICE no traen MW.")
+    print("  - El peso 1/longitud es un proxy de acoplamiento, no capacidad.")
+    return 0
+
+
+def parse_args(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(
+        description="ISLA VERDE - Fase cuantica completa (punto de entrada unico)"
+    )
+    parser.add_argument("--data-dir", type=Path, default=Path("data"),
+                        help="carpeta con los CSV del ICE")
+    parser.add_argument("--scratch-dir", type=Path, default=Path("scratch"),
+                        help="carpeta de salida de todos los artefactos")
+    parser.add_argument("--tiers", nargs="+",
+                        default=["mvp8", "std12", "large16"])
+    parser.add_argument("--p-values", nargs="+", type=int, default=[1, 2, 3],
+                        help="valores de p a barrer")
+    parser.add_argument("--shots", type=int, default=1000)
+    parser.add_argument("--n-runs", type=int, default=5,
+                        help="ejecuciones por punto (rubrica: >=5)")
+    parser.add_argument("--optimizer", type=str, default="COBYLA",
+                        choices=["COBYLA", "BFGS"],
+                        help="BFGS si COBYLA no converge")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--backend", type=str, default="local",
+                        choices=["local", "h2"],
+                        help="local = Qulacs (gratis); h2 = emulador Quantinuum")
+    parser.add_argument("--solo-cuantico", action="store_true",
+                        help="omite la etapa clasica (si ya corriste modelador_red.py)")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    global BACKEND
+    logging.basicConfig(level=logging.INFO,
+                        format="%(levelname)s %(name)s: %(message)s")
+    args = parse_args(argv)
+    BACKEND = args.backend
+    return run(args.data_dir, args.scratch_dir, args.tiers, args.p_values,
+               args.shots, args.n_runs, args.optimizer, args.seed,
+               args.solo_cuantico)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
