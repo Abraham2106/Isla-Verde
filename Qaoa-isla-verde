@@ -19,22 +19,33 @@ Contenido (todo en este archivo):
        comparar_qaoa.py) para reproducir todo de un tiron.
 
 Alineacion con la rubrica del Challenge 1:
-    - Se reporta la RAZON DE APROXIMACION (r = corte/optimo), nunca el
+    - Se reporta la RAZON DE APROXIMACION (r = E[corte]/optimo), nunca el
       costo bruto.
+    - El objetivo clasico que se optimiza es el VALOR ESPERADO del corte
+      (estandar QAOA: <psi|H_C|psi>), NO el mejor shot muestreado. Los
+      angulos finales se reevaluan con shots independientes y esa cifra
+      es la que se reporta; el mejor bitstring muestreado se conserva
+      solo como diagnostico. Optimizar/reportar el maximo de miles de
+      shots seria fuerza bruta estadistica disfrazada de QAOA (con
+      shots*maxiter*n_runs muestras se toca el optimo de instancias de
+      8-16 nodos por puro volumen, sin que el circuito converja).
     - Se reporta MEDIA +/- DESVIACION ESTANDAR sobre n_runs ejecuciones.
-      La cifra que se pasa a la comparacion es la MEDIA, no la mejor
-      corrida: la rubrica marca el "cherry-picking de la mejor ejecucion"
-      como red flag. El mejor valor se conserva solo como dato secundario.
+    - El Hamiltoniano del benchmark es el Ising de Max-Cut PURO (h=0,
+      J=w/2): el mismo problema cuyo optimo exacto calcula la fuerza
+      bruta. El Hamiltoniano completo con balance/carga critica ("ising"
+      en el JSON) es un problema DISTINTO y debe evaluarse aparte contra
+      baselines.h_total, nunca dividirse entre el optimo de Max-Cut.
     - Se soporta escalado de p (multiples valores de p).
     - Optimizador alternativo (BFGS) disponible si COBYLA no converge.
     - Consistencia max/min: se maximiza el corte minimizando su negativo.
 
 Limitacion honesta que debe acompanar todo reporte de estos resultados:
-    QAOA no supera a Goemans-Williamson para Max-Cut en ninguna instancia
-    conocida; para p=1 la garantia teorica (0.6924) es estrictamente
-    inferior a la de GW (0.878). Ademas, los balances de potencia B_i son
-    sinteticos (los CSV del ICE no traen MW) y el peso 1/longitud es un
-    proxy de acoplamiento, no una capacidad electrica real.
+    0.878 (Goemans-Williamson) es una garantia INFERIOR en esperanza del
+    peor caso, no un techo: superarla en instancias faciles es normal y
+    no demuestra ventaja cuantica (greedy ya alcanza el optimo exacto en
+    los tres tiers). Ademas, los balances de potencia B_i son sinteticos
+    (los CSV del ICE no traen MW) y el peso 1/longitud es un proxy de
+    acoplamiento, no una capacidad electrica real.
 
 Uso:
     python3 isla_verde_cuantico.py                          # todo, local
@@ -46,6 +57,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import subprocess
@@ -64,9 +76,12 @@ from pytket import Circuit
 
 logger = logging.getLogger("isla_verde.cuantico")
 
-# Cotas teoricas citadas por la rubrica.
-GW_GUARANTEE = 0.878        # Goemans & Williamson (1995), JACM 42(6)
-QAOA_P1_GUARANTEE = 0.6924  # Farhi, Goldstone & Gutmann (2014)
+# ES: Cota de Goemans-Williamson (1995), JACM 42(6). Es una garantia
+#     INFERIOR en esperanza del peor caso, NO un techo: cortes por encima de
+#     0.878 son legitimos y esperables en instancias faciles. La cota 0.6924
+#     de QAOA p=1 (Farhi et al. 2014) se elimino de este archivo: aplica solo
+#     a grafos 3-regulares sin pesos, que no son estas instancias.
+GW_GUARANTEE = 0.878
 
 # Backend por defecto; se sobreescribe con --backend.
 BACKEND = "local"
@@ -78,8 +93,12 @@ NEXUS_PROJECT = "isla-verde"   # nombre del proyecto Nexus (ajustar)
 # 1. Carga de la instancia (JSON producido por modelador_red.py)
 # ===========================================================================
 def cargar_instancia(scratch_dir: Path, tier: str) -> dict[str, Any] | None:
-    """Lee isla_verde_{tier}.json y devuelve variable_order, h, J_upper,
-    edges y el optimo exacto de fuerza bruta. None con warning si falta."""
+    """Lee isla_verde_{tier}.json y construye el Ising de Max-Cut PURO
+    (h=0, J_ij=w_ij/2) desde las aristas: es el mismo problema cuyo optimo
+    exacto calcula la fuerza bruta, asi numerador y denominador de r son
+    comparables. El "ising" completo del JSON (con alpha/beta) codifica el
+    Hamiltoniano restringido, que es OTRO problema, y no se usa aqui.
+    None con warning si falta el archivo."""
     path = scratch_dir / f"isla_verde_{tier}.json"
     if not path.exists():
         logger.warning("[%s] no se encontro %s. Corre primero la etapa "
@@ -87,22 +106,46 @@ def cargar_instancia(scratch_dir: Path, tier: str) -> dict[str, Any] | None:
                        tier, path, scratch_dir)
         return None
 
-    with open(path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
+    raw = path.read_bytes()
+    payload = json.loads(raw.decode("utf-8"))
 
     try:
         variable_order = payload["variable_order"]
-        h = np.array(payload["ising"]["h"], dtype=np.float64)
-        j_upper = np.array(payload["ising"]["J_upper"], dtype=np.float64)
         edges = payload["edges"]
         optimum = float(payload["baselines"]["maxcut"]["brute_force"]["cut"])
     except KeyError as exc:
         logger.warning("[%s] %s no tiene el campo esperado %s", tier, path, exc)
         return None
 
-    return {"tier": tier, "variable_order": variable_order, "h": h,
-            "J_upper": j_upper, "edges": edges, "optimum": optimum,
-            "n": len(variable_order)}
+    n = len(variable_order)
+    indice = {name: q for q, name in enumerate(variable_order)}
+    j_upper = np.zeros((n, n), dtype=np.float64)
+    for arista in edges:
+        i, j = sorted((indice[arista["u"]], indice[arista["v"]]))
+        j_upper[i, j] += float(arista["weight"]) / 2.0
+    h = np.zeros(n, dtype=np.float64)
+
+    # Contraste contra el ising_maxcut exportado por modelador_red.py.
+    exportado = payload.get("ising_maxcut")
+    if exportado is not None and not np.allclose(
+            j_upper, np.asarray(exportado["J_upper"], dtype=np.float64),
+            atol=1e-9):
+        logger.error("[%s] ising_maxcut del JSON no coincide con las "
+                     "aristas; se usa el derivado de las aristas", tier)
+
+    # ES: Normalizacion del Hamiltoniano del circuito: |J| alcanza ~10^2 y
+    #     COBYLA veria un paisaje ultra-oscilatorio en gamma. Escalar H_C por
+    #     una constante solo reparametriza gamma (misma familia de estados);
+    #     el corte reportado se evalua siempre desde las aristas sin escalar.
+    escala = float(np.abs(j_upper).max())
+    if escala <= 0.0:
+        escala = 1.0
+
+    return {"tier": tier, "variable_order": variable_order,
+            "h": h / escala, "J_upper": j_upper / escala,
+            "escala_hamiltoniano": escala, "edges": edges,
+            "optimum": optimum, "n": n,
+            "instance_sha256": hashlib.sha256(raw).hexdigest()}
 
 
 # ===========================================================================
@@ -218,16 +261,25 @@ def evaluar_angulos(params: np.ndarray, instancia: dict, backend, shots: int,
 # ===========================================================================
 def una_ejecucion(instancia: dict, backend, shots: int, p: int,
                   optimizer: str, x0: np.ndarray) -> dict[str, Any]:
-    """Optimizacion completa desde x0. Como scipy minimiza, se minimiza el
-    negativo del corte = maximizar (consistencia max/min)."""
-    mejor = {"corte": -np.inf, "bits": {}, "params": None}
+    """Optimizacion completa desde x0. El objetivo es el VALOR ESPERADO del
+    corte (estandar QAOA); como scipy minimiza, se minimiza su negativo.
+    Al terminar, los mejores angulos se REEVALUAN con shots independientes
+    y esa cifra es la que se reporta: seleccionar el maximo entre estimados
+    ruidosos sesgaria hacia arriba sin esta reevaluacion. El mejor bitstring
+    muestreado se conserva SOLO como diagnostico: optimizar o reportar el
+    maximo de shots*maxiter muestras seria fuerza bruta estadistica, no una
+    medicion del circuito."""
+    mejor = {"esperado": -np.inf, "params": x0.copy()}
+    diagnostico = {"corte": -np.inf, "bits": {}}
 
     def objetivo(params: np.ndarray) -> float:
-        _, corte_ind, bits = evaluar_angulos(params, instancia, backend,
-                                              shots, p)
-        if corte_ind > mejor["corte"]:
-            mejor.update(corte=corte_ind, bits=bits, params=params.copy())
-        return -corte_ind
+        esperado, corte_muestra, bits = evaluar_angulos(
+            params, instancia, backend, shots, p)
+        if esperado > mejor["esperado"]:
+            mejor.update(esperado=esperado, params=params.copy())
+        if corte_muestra > diagnostico["corte"]:
+            diagnostico.update(corte=corte_muestra, bits=bits)
+        return -esperado
 
     if optimizer.upper() == "BFGS":
         minimize(objetivo, x0, method="BFGS", options={"maxiter": 40})
@@ -235,10 +287,19 @@ def una_ejecucion(instancia: dict, backend, shots: int, p: int,
         minimize(objetivo, x0, method="COBYLA",
                  options={"maxiter": 40, "rhobeg": 0.5})
 
-    ratio = (mejor["corte"] / instancia["optimum"]
-             if instancia["optimum"] > 0 else float("nan"))
-    return {"cut": float(mejor["corte"]), "ratio": float(ratio),
-            "bits": mejor["bits"]}
+    # Reevaluacion final con shots frescos en los mejores angulos.
+    esperado_final, _, _ = evaluar_angulos(mejor["params"], instancia,
+                                           backend, shots, p)
+
+    optimo = instancia["optimum"]
+    return {
+        "cut": float(esperado_final),   # E[corte], cifra principal
+        "ratio": float(esperado_final / optimo) if optimo > 0 else float("nan"),
+        "params": [float(v) for v in mejor["params"]],
+        # Solo diagnostico (sesgado alto por construccion, no comparable):
+        "mejor_muestra": {"cut": float(diagnostico["corte"]),
+                          "bits": diagnostico["bits"]},
+    }
 
 
 # ===========================================================================
@@ -247,30 +308,48 @@ def una_ejecucion(instancia: dict, backend, shots: int, p: int,
 def resolver_instancia(instancia: dict, backend, shots: int, p: int,
                        n_runs: int, optimizer: str, seed: int) -> dict[str, Any]:
     """Corre n_runs optimizaciones independientes con arranques distintos.
-    Reporta media y desviacion estandar (lo que exige la rubrica) y ademas
-    el mejor y el peor, para transparencia."""
+    Cada corrida aporta el VALOR ESPERADO del corte en sus mejores angulos
+    (reevaluado con shots independientes); aqui se agregan media y
+    desviacion estandar sobre esas n_runs cifras, mas el mejor/peor para
+    transparencia."""
     tier = instancia["tier"]
     rng = np.random.default_rng(seed)
 
-    ratios, cortes = [], []
+    ratios, cortes, muestras_diag, detalle_runs = [], [], [], []
     for run in range(n_runs):
         x0 = rng.uniform(0.0, np.pi, size=2 * p)
         res = una_ejecucion(instancia, backend, shots, p, optimizer, x0)
         ratios.append(res["ratio"])
         cortes.append(res["cut"])
-        logger.info("[%s] p=%d run %d/%d: cut=%.4f  r=%.4f",
-                    tier, p, run + 1, n_runs, res["cut"], res["ratio"])
+        muestras_diag.append(res["mejor_muestra"]["cut"])
+        detalle_runs.append({
+            "run": run + 1, "cut": res["cut"], "ratio": res["ratio"],
+            "params": res["params"],
+            "mejor_muestra_cut": res["mejor_muestra"]["cut"],
+        })
+        logger.info("[%s] p=%d run %d/%d: E[cut]=%.4f  r=%.4f  "
+                    "(mejor muestra diag=%.4f)",
+                    tier, p, run + 1, n_runs, res["cut"], res["ratio"],
+                    res["mejor_muestra"]["cut"])
 
     ratios, cortes = np.array(ratios), np.array(cortes)
     return {
         "tier": tier, "p": p, "n_runs": n_runs, "optimizer": optimizer,
+        "shots": shots, "seed": seed,
+        "objetivo": "valor_esperado",
+        "instance_sha256": instancia["instance_sha256"],
         "optimum": instancia["optimum"],
-        # cifra principal reportada (sin cherry-picking)
+        # cifra principal: E[corte] por corrida, media/std entre corridas
         "cut_mean": float(cortes.mean()), "cut_std": float(cortes.std()),
         "ratio_mean": float(ratios.mean()), "ratio_std": float(ratios.std()),
         # datos secundarios, solo para transparencia
         "cut_best": float(cortes.max()), "ratio_best": float(ratios.max()),
         "ratio_worst": float(ratios.min()),
+        # diagnostico: mejor shot visto en todas las corridas (sesgado alto
+        # por construccion; NUNCA usarlo como cifra de rendimiento)
+        "mejor_muestra_diagnostico": float(max(muestras_diag)),
+        # procedencia por corrida: angulos finales y cifras individuales
+        "runs": detalle_runs,
     }
 
 
@@ -309,8 +388,9 @@ def barrer_p(scratch_dir: Path, tiers: list[str], p_values: list[int],
 def graficar_r_vs_p(resultados: dict[str, list[dict[str, Any]]],
                     out_path: Path) -> Path | None:
     """Figura obligatoria: razon de aproximacion vs p, con barras de error
-    (desviacion estandar sobre las n_runs ejecuciones) y las cotas teoricas
-    de GW y de QAOA p=1 que cita la rubrica."""
+    (desviacion estandar sobre las n_runs ejecuciones) y la cota de GW como
+    referencia (piso en esperanza, no techo). La cota 0.6924 de QAOA p=1 se
+    omite: aplica solo a grafos 3-regulares sin pesos."""
     if not resultados:
         logger.warning("Sin resultados: no se genera figura")
         return None
@@ -324,9 +404,7 @@ def graficar_r_vs_p(resultados: dict[str, list[dict[str, Any]]],
                     label=f"{tier} (media +/- desv. est.)")
 
     ax.axhline(GW_GUARANTEE, color="black", linestyle="--", linewidth=1,
-               label=f"Garantia GW ({GW_GUARANTEE})")
-    ax.axhline(QAOA_P1_GUARANTEE, color="gray", linestyle=":", linewidth=1,
-               label=f"Garantia QAOA p=1 ({QAOA_P1_GUARANTEE})")
+               label=f"Cota GW {GW_GUARANTEE} (piso en esperanza, no techo)")
 
     todos_p = sorted({r["p"] for serie in resultados.values() for r in serie})
     ax.set_xticks(todos_p)
@@ -402,13 +480,22 @@ def run(data_dir: Path, scratch_dir: Path, tiers: list[str],
             fila += f"{res['ratio_mean']:>15.4f} +/- {res['ratio_std']:<6.4f}"
         print(fila)
 
-    # JSON para la Fase 2. Se reporta la MEDIA, no la mejor corrida:
-    # la rubrica marca el cherry-picking como red flag.
+    # JSON para la Fase 2. La cifra es la MEDIA entre corridas del VALOR
+    # ESPERADO del corte (nunca el mejor shot): la rubrica marca el
+    # cherry-picking como red flag. Se incluye metadata de procedencia para
+    # que comparar_qaoa.py pueda validar consistencia.
     p_reporte = p_values[-1]
     resultados_fase2 = {}
     for tier, serie in resultados.items():
         res = next(r for r in serie if r["p"] == p_reporte)
-        resultados_fase2[tier] = {"cut": res["cut_mean"], "p": p_reporte}
+        resultados_fase2[tier] = {
+            "cut": res["cut_mean"], "p": p_reporte,
+            "objetivo": "valor_esperado",
+            "n_runs": res["n_runs"], "shots": res["shots"],
+            "seed": res["seed"], "optimizer": res["optimizer"],
+            "backend": res["backend"],
+            "instance_sha256": res["instance_sha256"],
+        }
     ruta_fase2 = scratch_dir / "qaoa_results.json"
     with open(ruta_fase2, "w", encoding="utf-8") as f:
         json.dump(resultados_fase2, f, indent=2, ensure_ascii=False)
@@ -439,8 +526,11 @@ def run(data_dir: Path, scratch_dir: Path, tiers: list[str],
         print(f"  [{marca}] {nombre}")
 
     print("\nRecordatorio para el informe (limitaciones honestas):")
-    print("  - QAOA no supera a GW para Max-Cut; en p=1 su garantia (0.6924)")
-    print("    es inferior a la de GW (0.878).")
+    print("  - La cifra QAOA es el VALOR ESPERADO del corte (media entre")
+    print("    corridas); el mejor shot es solo diagnostico.")
+    print("  - 0.878 (GW) es un piso en esperanza, no un techo: superarlo en")
+    print("    instancias faciles (greedy ya toca el optimo) no demuestra")
+    print("    ventaja cuantica.")
     print("  - Los balances B_i son sinteticos: los CSV del ICE no traen MW.")
     print("  - El peso 1/longitud es un proxy de acoplamiento, no capacidad.")
     return 0

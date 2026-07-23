@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import matplotlib
-.
+
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -272,13 +272,18 @@ def build_qubo(
     n = balances.shape[0]
     q_matrix = np.zeros((n, n), dtype=np.float64)
 
-    # ES: H_cut = -sum W(x_i + x_j - 2 x_i x_j): minimizar premia dejar los
-    #     extremos de lineas pesadas (cortas, muy acopladas) en la MISMA isla;
-    #     el corte solo rompe los acoples debiles, que es lo que frena la
-    #     cascada durante el islanding controlado.
-    # EN: H_cut = -sum W(x_i + x_j - 2 x_i x_j): minimizing rewards keeping
-    #     heavy (short, strongly coupled) line endpoints on the SAME island;
-    #     the cut severs only weak couplings, arresting cascading failures.
+    # ES: H_cut = -sum W(x_i + x_j - 2 x_i x_j) = -(corte ponderado):
+    #     minimizar MAXIMIZA el peso total cortado (Max-Cut, el benchmark que
+    #     exige el reto). Nota fisica honesta: con W = 1/longitud como proxy
+    #     de acoplamiento, Max-Cut tiende a cortar las lineas MAS acopladas,
+    #     no las debiles; "preservar acoples fuertes y romper solo los
+    #     debiles" seria un Min-Cut restringido, que es un problema distinto.
+    # EN: H_cut = -sum W(x_i + x_j - 2 x_i x_j) = -(weighted cut):
+    #     minimizing MAXIMIZES total cut weight (Max-Cut, the challenge
+    #     benchmark). Honest physics note: with W = 1/length as a coupling
+    #     proxy, Max-Cut tends to sever the MOST strongly coupled lines, not
+    #     the weak ones; "preserve strong couplings, break only weak ones"
+    #     would be a constrained Min-Cut, which is a different problem.
     for i, j, w in edges:
         q_matrix[i, i] -= w          # parte lineal / linear part -W(x_i+x_j)
         q_matrix[j, j] -= w
@@ -971,6 +976,20 @@ class ICEPowerGridModeler:
 
         for tier, model in self.instances.items():
             index = {name: i for i, name in enumerate(model.variable_order)}
+            # ES: Ising de Max-Cut PURO (sin alpha/beta): C(x) = sum w(1-z_i z_j)/2,
+            #     asi que max C == min [sum (w/2) z_i z_j - sum w/2]. Es el
+            #     Hamiltoniano que debe usar QAOA para el benchmark contra
+            #     brute_force.cut; el "ising" completo (con penalizaciones)
+            #     es un problema distinto y se compara contra h_total.
+            # EN: PURE Max-Cut Ising (no alpha/beta): the Hamiltonian QAOA must
+            #     use for the benchmark against brute_force.cut; the full
+            #     "ising" (with penalties) is a different problem, compared
+            #     against h_total instead.
+            n_vars_export = len(model.variable_order)
+            maxcut_j_upper = np.zeros((n_vars_export, n_vars_export))
+            for i, j, w in model.edges_idx:
+                maxcut_j_upper[i, j] += w / 2.0
+            maxcut_offset = -float(sum(w for _, _, w in model.edges_idx)) / 2.0
             payload = {
                 "metadata": metadata,
                 "variable_order": model.variable_order,
@@ -1010,6 +1029,16 @@ class ICEPowerGridModeler:
                     "h": model.h_vec.tolist(),
                     "J_upper": model.j_upper.tolist(),
                     "offset": model.ising_offset,
+                    "problema": "H_total (corte + alpha*balance^2 + beta*critico); "
+                                "comparar contra baselines.h_total, NO contra "
+                                "baselines.maxcut",
+                },
+                "ising_maxcut": {
+                    "h": [0.0] * n_vars_export,
+                    "J_upper": maxcut_j_upper.tolist(),
+                    "offset": maxcut_offset,
+                    "problema": "Max-Cut puro (min H == -corte maximo); "
+                                "benchmark contra baselines.maxcut.brute_force",
                 },
                 "baselines": model.baselines,
             }
@@ -1185,6 +1214,22 @@ class ICEPowerGridModeler:
             checks.append((3, f"[{tier}] Ising == QUBO at mapped spins",
                            "hard", max_err_i < 1e-6,
                            f"max |dE| = {max_err_i:.3e}"))
+
+            # 3b. ES: Ising Max-Cut puro (h=0, J=w/2) == -corte, duro: el
+            #     Hamiltoniano del benchmark QAOA debe reproducir el corte.
+            #     EN: pure Max-Cut Ising (h=0, J=w/2) == -cut, hard: the QAOA
+            #     benchmark Hamiltonian must reproduce the cut exactly.
+            maxcut_j = np.zeros((n_vars, n_vars))
+            for i_e, j_e, w_e in model.edges_idx:
+                maxcut_j[i_e, j_e] += w_e / 2.0
+            maxcut_off = -float(sum(w for _, _, w in model.edges_idx)) / 2.0
+            e_maxcut = ising_energies(
+                np.zeros(n_vars), maxcut_j, maxcut_off, spins
+            )
+            max_err_mc = float(np.abs(e_maxcut + cut).max())
+            checks.append((3, f"[{tier}] Max-Cut Ising == -cut (25 samples)",
+                           "hard", max_err_mc < 1e-6,
+                           f"max |dE| = {max_err_mc:.3e}"))
 
             # 4. ES: Fuerza bruta >= greedy, duro. / EN: brute >= greedy, hard.
             brute = model.baselines["maxcut"]["brute_force"]["cut"]

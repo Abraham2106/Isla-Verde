@@ -27,3 +27,9 @@ h3==4.1.2             # Mallas hexagonales jerárquicas (reducción geoespacial)
 
 # --- Visualización ---
 matplotlib==3.9.2     # Gráficos de la red, particiones y mapas de calor
+
+# --- Fase cuántica (Qaoa-isla-verde) ---
+pytket==2.18.1            # Construcción y compilación del circuito QAOA
+pytket-qulacs==0.42.0     # Backend local Qulacs (simulador, --backend local)
+pytket-quantinuum==0.59.1 # Backend H2 de Quantinuum (--backend h2)
+qnexus==0.46.0            # Acceso a Quantinuum Nexus para el emulador H2

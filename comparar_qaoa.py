@@ -22,6 +22,7 @@ Uso / Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import sys
@@ -38,7 +39,17 @@ import matplotlib.pyplot as plt
 logger = logging.getLogger("isla_verde.comparar_qaoa")
 
 DEFAULT_TIERS: tuple[str, ...] = ("mvp8", "std12", "large16")
+# ES: Garantia INFERIOR en esperanza de GW (piso del peor caso, NO un techo:
+#     superarla en instancias faciles es legitimo). / EN: GW lower bound in
+# expectation (worst-case floor, NOT a ceiling).
 GW_THEORETICAL_GUARANTEE = 0.878  # Goemans & Williamson, 1995
+# ES: Ningun corte puede superar el optimo exacto de fuerza bruta; un ratio
+#     mayor que 1 + tolerancia solo puede ser un bug (instancias distintas,
+#     denominador equivocado o cherry-picking) y se rechaza.
+# EN: No cut can exceed the exact brute-force optimum; ratio > 1 + tolerance
+#     can only be a bug (mismatched instances, wrong denominator, or
+#     cherry-picking) and is rejected.
+RATIO_TOLERANCE = 1e-6
 
 
 @dataclass(frozen=True)
@@ -64,20 +75,39 @@ def load_qaoa_results(path: Path | None, tiers: tuple[str, ...]) -> dict[str, di
         )
         return empty
 
-    with open(path, "r", encoding="utf-8") as f:
+    # utf-8-sig: tolera el BOM que agregan editores/PowerShell en Windows.
+    with open(path, "r", encoding="utf-8-sig") as f:
         raw = json.load(f)
 
     results = dict(empty)
     for tier in tiers:
         if tier in raw and raw[tier].get("cut") is not None:
-            results[tier] = {"cut": float(raw[tier]["cut"]), "p": raw[tier].get("p")}
+            results[tier] = {
+                "cut": float(raw[tier]["cut"]),
+                "p": raw[tier].get("p"),
+                "objetivo": raw[tier].get("objetivo"),
+                "instance_sha256": raw[tier].get("instance_sha256"),
+            }
+            if results[tier]["objetivo"] not in (None, "valor_esperado"):
+                logger.warning(
+                    "[%s] el JSON de QAOA declara objetivo=%r; la cifra "
+                    "valida para comparar es el VALOR ESPERADO del corte, "
+                    "no el mejor shot / expected cut required, not best "
+                    "sample", tier, results[tier]["objetivo"],
+                )
         else:
             logger.warning("[%s] sin resultado QAOA en %s / no QAOA result "
                            "in %s: pendiente / pending", tier, path, path)
     return results
 
 
-def load_baselines(scratch_dir: Path, tier: str) -> dict[str, Any] | None:
+def load_baselines(
+    scratch_dir: Path, tier: str
+) -> tuple[dict[str, Any], str] | None:
+    """Devuelve (baselines.maxcut, sha256 del archivo de instancia) para
+    poder validar que QAOA corrio sobre EXACTAMENTE esta instancia (los
+    resultados de Baseline/ sobre el grafo completo de 46 nodos NO son
+    comparables con un tier de 8-16)."""
     path = scratch_dir / f"isla_verde_{tier}.json"
     if not path.exists():
         logger.warning(
@@ -86,15 +116,15 @@ def load_baselines(scratch_dir: Path, tier: str) -> dict[str, Any] | None:
         )
         return None
 
-    with open(path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
+    raw = path.read_bytes()
+    payload = json.loads(raw.decode("utf-8"))
 
     baselines = payload.get("baselines", {}).get("maxcut")
     if baselines is None:
         logger.warning("[%s] %s no contiene baselines.maxcut / missing "
                        "baselines.maxcut", tier, path)
         return None
-    return baselines
+    return baselines, hashlib.sha256(raw).hexdigest()
 
 
 @dataclass
@@ -147,7 +177,8 @@ def print_table(comparison: TierComparison) -> None:
     print(f"{'Goemans-Williamson':<{width}}{gw_cut_text:>14}{format_ratio(comparison.gw_r):>12}")
 
     if comparison.qaoa_cut is not None:
-        etiqueta = f"QAOA (p={comparison.qaoa_p})" if comparison.qaoa_p else "QAOA"
+        etiqueta = (f"QAOA E[corte] (p={comparison.qaoa_p})"
+                    if comparison.qaoa_p else "QAOA E[corte]")
         print(f"{etiqueta:<{width}}{comparison.qaoa_cut:>14.4f}{comparison.qaoa_r:>12.4f}")
     else:
         print(f"{'QAOA':<{width}}{'(pendiente)':>14}{'(pendiente)':>12}")
@@ -158,7 +189,7 @@ def plot_comparison(comparisons: list[TierComparison], out_path: Path) -> Path:
     metodos = [
         ("greedy_r", "Greedy", "#888888"),
         ("gw_r", "Goemans-Williamson", "#1f77b4"),
-        ("qaoa_r", "QAOA", "#d62728"),
+        ("qaoa_r", "QAOA (valor esperado)", "#d62728"),
     ]
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -172,7 +203,9 @@ def plot_comparison(comparisons: list[TierComparison], out_path: Path) -> Path:
         ax.bar(pos_offset, valores, width=ancho, label=etiqueta, color=color)
 
     ax.axhline(GW_THEORETICAL_GUARANTEE, color="black", linestyle="--",
-               linewidth=1, label=f"Garantia teorica GW ({GW_THEORETICAL_GUARANTEE})")
+               linewidth=1,
+               label=f"Cota GW {GW_THEORETICAL_GUARANTEE} "
+                     "(piso en esperanza, no techo)")
     ax.set_xticks([p + ancho * (n_metodos - 1) / 2 for p in posiciones])
     ax.set_xticklabels(tiers)
     ax.set_ylabel("Razon de aproximacion / approximation ratio (r = corte/optimo)")
@@ -195,13 +228,44 @@ def run(cfg: Config) -> int:
     qaoa_results = load_qaoa_results(cfg.qaoa_results_path, cfg.tiers)
 
     comparisons: list[TierComparison] = []
+    violaciones: list[str] = []
     for tier in cfg.tiers:
-        baselines = load_baselines(cfg.scratch_dir, tier)
-        if baselines is None:
+        cargado = load_baselines(cfg.scratch_dir, tier)
+        if cargado is None:
             continue
+        baselines, instancia_sha = cargado
+
+        # ES: QAOA debe haber corrido sobre EXACTAMENTE esta instancia; los
+        #     resultados del grafo completo (Baseline/) no son comparables.
+        # EN: QAOA must have run on EXACTLY this instance; full-graph results
+        #     (Baseline/) are not comparable with a tier.
+        sha_qaoa = qaoa_results[tier].get("instance_sha256")
+        if sha_qaoa is not None and sha_qaoa != instancia_sha:
+            logger.error(
+                "[%s] el resultado QAOA proviene de OTRA instancia (sha256 "
+                "%s... != %s...): no comparable / QAOA result computed on a "
+                "DIFFERENT instance, not comparable",
+                tier, sha_qaoa[:12], instancia_sha[:12],
+            )
+            violaciones.append(f"{tier}: instancia distinta (sha256)")
+
         comparison = compute_ratios(tier, baselines, qaoa_results[tier])
         comparisons.append(comparison)
         print_table(comparison)
+
+        # ES: Guardrail: contra el optimo exacto, r > 1 es imposible.
+        # EN: Guardrail: against the exact optimum, r > 1 is impossible.
+        for metodo, ratio in (("greedy", comparison.greedy_r),
+                              ("goemans_williamson", comparison.gw_r),
+                              ("qaoa", comparison.qaoa_r)):
+            if ratio is not None and ratio > 1.0 + RATIO_TOLERANCE:
+                logger.error(
+                    "[%s] ratio %s = %.6f > 1: imposible contra el optimo "
+                    "exacto; revisa instancia, denominador o cherry-picking "
+                    "/ impossible vs exact optimum; check instance, "
+                    "denominator, or cherry-picking", tier, metodo, ratio,
+                )
+                violaciones.append(f"{tier}: {metodo} r={ratio:.6f} > 1")
 
     if not comparisons:
         logger.error(
@@ -222,6 +286,13 @@ def run(cfg: Config) -> int:
             "cuantico / pass --qaoa-results with the quantum team's JSON.",
             ", ".join(pendientes),
         )
+
+    if violaciones:
+        logger.error(
+            "COMPARACION INVALIDA / INVALID COMPARISON: %s",
+            "; ".join(violaciones),
+        )
+        return 2
     return 0
 
 
