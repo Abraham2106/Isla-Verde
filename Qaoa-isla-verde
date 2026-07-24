@@ -86,7 +86,10 @@ GW_GUARANTEE = 0.878
 
 # Backend por defecto; se sobreescribe con --backend.
 BACKEND = "local"
-EMULATOR_NAME = "H2-1E"        # nombre del emulador en Nexus (ajustar)
+EMULATOR_NAME = "H2-Emulator"  # emulador alojado en Nexus, gratis (segundos)
+                                # "H2-1E"/"H2-2E" son emuladores en la nube
+                                # de Quantinuum que consumen HQCs y requieren
+                                # aprovisionamiento aparte en la cuenta Nexus
 NEXUS_PROJECT = "isla-verde"   # nombre del proyecto Nexus (ajustar)
 
 
@@ -301,8 +304,8 @@ def evaluar_angulos(params: np.ndarray, instancia: dict, backend, shots: int,
 # ===========================================================================
 # 6. Una ejecucion: optimizacion de angulos desde un arranque dado
 # ===========================================================================
-def una_ejecucion(instancia: dict, backend, shots: int, p: int,
-                  optimizer: str, x0: np.ndarray) -> dict[str, Any]:
+def una_ejecucion(instancia: dict, backend_opt, backend_eval, shots: int,
+                  p: int, optimizer: str, x0: np.ndarray) -> dict[str, Any]:
     """Optimizacion completa desde x0. El objetivo es el VALOR ESPERADO del
     corte (estandar QAOA); como scipy minimiza, se minimiza su negativo.
     Al terminar, los mejores angulos se REEVALUAN con shots independientes
@@ -310,13 +313,22 @@ def una_ejecucion(instancia: dict, backend, shots: int, p: int,
     ruidosos sesgaria hacia arriba sin esta reevaluacion. El mejor bitstring
     muestreado se conserva SOLO como diagnostico: optimizar o reportar el
     maximo de shots*maxiter muestras seria fuerza bruta estadistica, no una
-    medicion del circuito."""
+    medicion del circuito.
+
+    backend_opt es el backend usado DENTRO del bucle de optimizacion clasica
+    (cientos de evaluaciones): siempre local/Qulacs, incluso cuando se pide
+    --backend h2, porque enviar cada evaluacion de COBYLA como un job remoto
+    a Nexus (upload+compile+execute+poll) es demasiado lento para converger
+    en tiempo razonable. backend_eval es el backend con el que se hace la
+    REEVALUACION FINAL reportada (una sola vez por corrida): ahi si se usa
+    el emulador H2 cuando corresponde, que es lo que importa para reportar
+    resultados en hardware/emulador real."""
     mejor = {"esperado": -np.inf, "params": x0.copy()}
     diagnostico = {"corte": -np.inf, "bits": {}}
 
     def objetivo(params: np.ndarray) -> float:
         esperado, corte_muestra, bits = evaluar_angulos(
-            params, instancia, backend, shots, p)
+            params, instancia, backend_opt, shots, p)
         if esperado > mejor["esperado"]:
             mejor.update(esperado=esperado, params=params.copy())
         if corte_muestra > diagnostico["corte"]:
@@ -331,7 +343,7 @@ def una_ejecucion(instancia: dict, backend, shots: int, p: int,
 
     # Reevaluacion final con shots frescos en los mejores angulos.
     esperado_final, _, _ = evaluar_angulos(mejor["params"], instancia,
-                                           backend, shots, p)
+                                           backend_eval, shots, p)
 
     optimo = instancia["optimum"]
     return {
@@ -347,8 +359,9 @@ def una_ejecucion(instancia: dict, backend, shots: int, p: int,
 # ===========================================================================
 # 7. n_runs ejecuciones con distintas inicializaciones -> estadistica
 # ===========================================================================
-def resolver_instancia(instancia: dict, backend, shots: int, p: int,
-                       n_runs: int, optimizer: str, seed: int) -> dict[str, Any]:
+def resolver_instancia(instancia: dict, backend_opt, backend_eval, shots: int,
+                       p: int, n_runs: int, optimizer: str,
+                       seed: int) -> dict[str, Any]:
     """Corre n_runs optimizaciones independientes con arranques distintos.
     Cada corrida aporta el VALOR ESPERADO del corte en sus mejores angulos
     (reevaluado con shots independientes); aqui se agregan media y
@@ -360,7 +373,8 @@ def resolver_instancia(instancia: dict, backend, shots: int, p: int,
     ratios, cortes, muestras_diag, detalle_runs = [], [], [], []
     for run in range(n_runs):
         x0 = rng.uniform(0.0, np.pi, size=2 * p)
-        res = una_ejecucion(instancia, backend, shots, p, optimizer, x0)
+        res = una_ejecucion(instancia, backend_opt, backend_eval, shots, p,
+                            optimizer, x0)
         ratios.append(res["ratio"])
         cortes.append(res["cut"])
         muestras_diag.append(res["mejor_muestra"]["cut"])
@@ -403,7 +417,18 @@ def barrer_p(scratch_dir: Path, tiers: list[str], p_values: list[int],
              ) -> dict[str, list[dict[str, Any]]]:
     """Para cada instancia y cada p, corre el bloque completo de n_runs
     ejecuciones. Devuelve {tier: [res_p1, res_p2, ...]}."""
-    backend, etiqueta = obtener_backend()
+    backend_eval, etiqueta = obtener_backend()
+    if BACKEND == "h2":
+        # La optimizacion clasica (COBYLA/BFGS) hace cientos de evaluaciones;
+        # enviarlas todas como jobs remotos a Nexus es demasiado lento
+        # (cada una es un ciclo upload+compile+execute+poll). Se optimiza en
+        # local y solo la REEVALUACION FINAL de cada corrida va a H2.
+        from pytket.extensions.qulacs import QulacsBackend
+        backend_opt = QulacsBackend()
+        logger.info("Optimizacion de angulos: LOCAL (Qulacs). "
+                    "Reevaluacion final por corrida: %s", etiqueta)
+    else:
+        backend_opt = backend_eval
     logger.info("Barrido p=%s sobre %s | backend=%s | n_runs=%d | shots=%d",
                 p_values, tiers, etiqueta, n_runs, shots)
 
@@ -416,8 +441,8 @@ def barrer_p(scratch_dir: Path, tiers: list[str], p_values: list[int],
         for p in p_values:
             logger.info("[%s] p=%d (%d qubits, %d ejecuciones)...",
                         tier, p, instancia["n"], n_runs)
-            res = resolver_instancia(instancia, backend, shots, p, n_runs,
-                                     optimizer, seed)
+            res = resolver_instancia(instancia, backend_opt, backend_eval,
+                                     shots, p, n_runs, optimizer, seed)
             res["backend"] = etiqueta
             serie.append(res)
             print(f"  [{tier}] p={p}: r = {res['ratio_mean']:.4f} "
