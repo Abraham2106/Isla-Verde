@@ -57,6 +57,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import logging
@@ -205,6 +206,51 @@ def construir_circuito_qaoa(n: int, h: np.ndarray, j_upper: np.ndarray,
 # ===========================================================================
 # 4. Backend: local (Qulacs) o H2 (emulador Quantinuum via qnexus)
 # ===========================================================================
+class _NexusH2Backend:
+    """Envoltorio sincrono sobre qnexus que imita la interfaz minima de
+    QulacsBackend (get_compiled_circuit / run_circuit(...).get_counts())
+    que usa evaluar_angulos().
+
+    A partir de pytket-quantinuum 0.56.0 se elimino todo acceso remoto
+    (incluido QuantinuumBackend.login()); el envio de jobs a Quantinuum se
+    hace ahora exclusivamente via qnexus, que trabaja por jobs asincronos
+    (upload -> compile job -> execute job -> download_result), no con un
+    run_circuit() directo. Este envoltorio hace ese flujo sincrono para no
+    tocar el resto del pipeline."""
+
+    def __init__(self, device_name: str, project_name: str):
+        import qnexus as qnx
+        self._qnx = qnx
+        self._job_id = 0
+
+        qnx.login()
+        project = qnx.projects.get_or_create(name=project_name)
+        qnx.context.set_active_project(project)
+        self._config = qnx.QuantinuumConfig(device_name=device_name)
+
+    def get_compiled_circuit(self, circ):
+        # La compilacion real ocurre en start_compile_job (run_circuit).
+        return circ
+
+    def run_circuit(self, circ, n_shots: int):
+        qnx = self._qnx
+        self._job_id += 1
+        sufijo = f"{self._job_id}-{datetime.datetime.now():%Y%m%d-%H%M%S}"
+
+        ref_circ = qnx.circuits.upload(circuit=circ, name=f"qaoa-{sufijo}")
+        ref_compile = qnx.start_compile_job(
+            programs=[ref_circ], backend_config=self._config,
+            optimisation_level=2, name=f"qaoa-compile-{sufijo}")
+        qnx.jobs.wait_for(ref_compile)
+        circ_compilado = qnx.jobs.results(ref_compile)[0].get_output()
+
+        ref_execute = qnx.start_execute_job(
+            programs=[circ_compilado], n_shots=[n_shots],
+            backend_config=self._config, name=f"qaoa-exec-{sufijo}")
+        qnx.jobs.wait_for(ref_execute)
+        return qnx.jobs.results(ref_execute)[0].download_result()
+
+
 def obtener_backend():
     """Devuelve (backend, etiqueta) segun la variable global BACKEND."""
     if BACKEND == "local":
@@ -213,13 +259,9 @@ def obtener_backend():
         return QulacsBackend(), "local-qulacs"
 
     if BACKEND == "h2":
-        import qnexus as qnx
-        from pytket.extensions.quantinuum import QuantinuumBackend
         logger.info("Backend H2: %s via qnexus (proyecto %s)",
                     EMULATOR_NAME, NEXUS_PROJECT)
-        qnx.projects.get_or_create(name=NEXUS_PROJECT)
-        backend = QuantinuumBackend(device_name=EMULATOR_NAME)
-        backend.login()
+        backend = _NexusH2Backend(EMULATOR_NAME, NEXUS_PROJECT)
         return backend, f"h2-{EMULATOR_NAME}"
 
     raise ValueError(f"BACKEND desconocido: {BACKEND!r} (usar 'local' o 'h2')")
