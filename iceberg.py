@@ -83,7 +83,9 @@ def construir_circuito_qaoa_iceberg(instancia: dict, gammas: np.ndarray,
     J = np.asarray(instancia["J_upper"], dtype=float)
     p = len(gammas)
 
-    circ = Circuit(n + 2)          # n datos + 2 ancillas de sindrome
+    # Bits clasicos: 2 por ronda mid (SX,SZ) + 1 SX terminal + n medida final.
+    n_cbits = 2 * rondas_sindrome + 1 + n
+    circ = Circuit(n + 2, n_cbits)  # n datos + 2 ancillas de sindrome
     cbit = 0                        # contador de bits clasicos
     sindrome_bits: list[int] = []   # bits que deben leer 0 (SX/SZ mid-circuito)
 
@@ -141,7 +143,8 @@ def construir_circuito_qaoa_iceberg(instancia: dict, gammas: np.ndarray,
             ronda_sindrome_mid()
 
     # --- Ronda terminal de SX + medida destructiva (deriva SZ y bits) ------
-    circ.add_gate(OpType.Reset, [a2])
+    if rondas_sindrome > 0:        # a2 solo necesita reset si ya se uso antes
+        circ.add_gate(OpType.Reset, [a2])
     circ.H(a2)
     for q in range(n):
         circ.CX(a2, q)

@@ -22,6 +22,8 @@ isla-verde-v2/
 │   ├── Subestaciones.csv
 │   └── LineasDeTransmision.csv
 ├── modelador_red.py           # Pipeline clásico de datos (producción)
+├── qaoa.py                    # Circuito QAOA + ejecución local y en H2 (Nexus)
+├── iceberg.py                 # Extensión OPCIONAL: código QED Iceberg [[k+2,k,2]]
 ├── requirements.txt           # Dependencias pineadas (Python 3.12)
 ├── .gitignore                 # Exclusiones estándar de Python
 └── README.md                  # Este documento
