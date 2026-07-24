@@ -48,6 +48,10 @@ Capa H3 como agregación y visualización, no como cuello de botella. La malla h
 
 Mapa estático mínimo desde el Día 1. Como parte del pipeline reproducible se genera desde el Día 1 un mapa estático en matplotlib (grafo con la partición coloreada por isla). El mapa interactivo H3 es bonus: si el tiempo aprieta, el pitch ya tiene visualización garantizada producida por el mismo pipeline que reproduce las demás figuras.
 
+### Capa 3, Detección de errores Iceberg (extensión EFTQC, opcional)
+
+Como capa de *early fault-tolerance*, el repositorio incluye una implementación autónoma del código de detección de errores cuánticos (QED) **Iceberg `[[k+2,k,2]]`** (Self, Benedetti & Amaro 2022) sobre el QAOA de Max-Cut, siguiendo el precedente medido de He et al. (2024, *Performance of QAOA with Quantum Error Detection*). Está **desconectada del pipeline** (`iceberg.py`, sin tocar el núcleo `qaoa.py`) y solo justifica que la implementación es real: codifica `k` qubits lógicos en `k+2` físicos + 2 ancillas, compila el costo `Z̄_iZ̄_j = Z_iZ_j` en una puerta ZZ nativa por arista (cero sobrecosto) y la mezcla `exp(-iβX̄_i)=exp(-iβX_iX_t)` en una puerta XX, y post-selecciona por síndrome `SX`/`SZ`. Framing honesto: sin ruido reproduce exactamente el resultado sin codificar con 0 % de descarte; la ventaja solo aparece bajo ruido en el emulador H2. Presupuesto de qubits documentado: codificado usa `k+4` físicos, y el emulador H2 de Nexus (tope 20 qubits) admite hasta la instancia de 16 nodos (`large16 → 20`).
+
 ## 3. Stack técnico
 
 Núcleo: Python, NetworkX (grafo), pytket (QUBO/QAOA), CVXPY (Goemans-Williamson), SciPy (optimización clásica y recocido simulado opcional), fuerza bruta propia para el óptimo. Plataforma: emulador H2 de Quantinuum (Guppy como vía preferente de acceso, `pytket-quantinuum` como respaldo). Geoespacial: h3-py sobre datos del ICE (datos-ice-se.opendata.arcgis.com). Visualización: mapa estático matplotlib (Día 1) + mapa hexagonal interactivo (bonus), ambos generados por el pipeline reproducible.

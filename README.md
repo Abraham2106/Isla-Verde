@@ -90,6 +90,22 @@ El script ejecuta cuatro fases secuenciales y deterministas:
 **Fase 4 — Formulación matemática QUBO/Ising.** Traduce el problema de particionamiento a la función objetivo cuadrática binaria: minimizar el peso de las líneas cortadas entre islas sujeto a penalizaciones de balance de carga/generación. Genera la matriz **Q** del QUBO y, mediante el cambio de variable `s = 2x − 1`, los coeficientes equivalentes del hamiltoniano de Ising (**h**, **J**), listos para QAOA o *annealing*.
 
 
+## 6. Extensión opcional — Código de detección de errores Iceberg (`iceberg.py`)
+
+Como capa de *early fault-tolerance* (EFTQC), el repositorio incluye una implementación autónoma del código de **detección de errores cuánticos (QED) Iceberg `[[k+2,k,2]]`** (Self, Benedetti & Amaro, arXiv:2211.06703), aplicado al circuito QAOA de Max-Cut siguiendo el precedente directo de He et al. (arXiv:2409.12104, *Performance of QAOA with Quantum Error Detection*).
+
+Es un módulo **desconectado del pipeline principal**: no se ejecuta desde `modelador_red.py` ni desde el punto de entrada, e importa de `qaoa.py` sin modificarlo, de modo que el núcleo del reto queda intacto. Se corre por separado con:
+
+```bash
+python iceberg.py --tier mvp8 -p 1
+```
+
+**Qué implementa.** Codifica `k` qubits lógicos en `n = k+2` qubits físicos más 2 ancillas de síndrome (total `k+4`). Aprovecha la estructura del código para compilar el QAOA con puertas nativas de iones atrapados: la capa de costo `Z̄_iZ̄_j = Z_iZ_j` se implementa con **una puerta ZZ nativa por arista y cero sobrecosto**, y la mezcla `exp(-iβX̄_i) = exp(-iβX_iX_t)` con una sola puerta XX de dos qubits por qubit lógico. El síndrome de los estabilizadores `SX`/`SZ` se mide por **post-selección**: cualquier disparo con error detectado se descarta (sin decodificación), como corresponde a QED.
+
+**Verificación de correctitud.** En el simulador local sin ruido, el circuito codificado reproduce exactamente la razón de aproximación del circuito sin codificar (`r` idéntico) con 0 % de descarte —evidencia de que la codificación no altera el resultado lógico y de que el síndrome solo dispara ante ruido real. La ventaja del Iceberg (mayor `r` a igual profundidad) se materializa únicamente bajo ruido, medible en el emulador H2.
+
+**Presupuesto de qubits.** El emulador H2 alojado en Nexus está limitado a 20 qubits. Codificado son `k+4` físicos: `mvp8 → 12`, `std12 → 16`, `large16 → 20` (justo en el tope). Instancias mayores no caben codificadas en el emulador alojado; se documenta como limitación.
+
 ## 8. Referencias
 
 Goemans, M. X., & Williamson, D. P. (1995). *Improved approximation algorithms for maximum cut and satisfiability problems using semidefinite programming*. Journal of the ACM, 42(6), 1115–1145. — Lucas, A. (2014). *Ising formulations of many NP problems*. Frontiers in Physics, 2, 5. — Uber Technologies. *H3: Hexagonal hierarchical geospatial indexing system*. https://h3geo.org — Hagberg, A., Schult, D., & Swart, P. (2008). *Exploring network structure, dynamics, and function using NetworkX*.
