@@ -1,34 +1,11 @@
 #!/usr/bin/env python3
-"""ISLA VERDE v3.0 - Fase 1 / Phase 1: Capa clasica de datos y grafo.
+"""ISLA VERDE v3.0 — Pipeline clásico: red ICE 230kV → QUBO/Ising.
 
-ES: Construye el grafo de transmision 230 kV del ICE desde los CSV oficiales,
-    extrae tres instancias NISQ verificadas (MVP-8 / STD-12 / LARGE-16),
-    formula el Max-Cut restringido como QUBO e Ising, calcula lineas base
-    clasicas y exporta un JSON por instancia para el equipo cuantico
-    (
-EN: Builds the ICE 230 kV transmission graph from the official CSVs,
-    extracts three verified NISQ instances (MVP-8 / STD-12 / LARGE-16),
-    formulates the constrained Max-Cut as QUBO and Ising, computes classical
-    baselines, and exports one JSON bundle per instance for the quantum team
- 
+Construye el grafo de transmisión 230 kV del ICE desde CSV oficiales,
+extrae instancias NISQ (MVP-8/STD-12/LARGE-16), formula Max-Cut como
+QUBO e Ising, calcula líneas base clásicas y exporta JSON por instancia.
 
-Modulos / Modules (M1 -> M11 desde main() / from main()):
-    M1  Configuracion / Config (dataclass congelada, argparse)
-    M2  Normalizacion de nombres y parseo de circuitos / Name normalization
-    M3  Construccion del grafo / Graph construction
-    M4  Extraccion de instancias / Instance extraction
-    M5  Balance de potencia sintetico / Synthetic power balance
-    M6  Constructor QUBO/Ising con autocalibracion / QUBO/Ising builder
-    M7  Lineas base clasicas / Classical baselines
-    M8  Capa geoespacial H3 (opcional) / H3 layer (optional)
-    M9  Exportacion JSON / JSON export
-    M10 Visualizacion matplotlib / Static visualization
-    M11 Suite de autoverificacion / Self-verification suite
-
-Uso / Usage:
-    python3 modelador_red.py --data-dir /ruta/csvs --out-dir /ruta/salida
-
-
+Uso: python modelador_red.py --data-dir ./data --out-dir ./scratch
 """
 
 from __future__ import annotations
@@ -43,10 +20,11 @@ import sys
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
+import cvxpy as cp
+import h3
 import matplotlib
 
 matplotlib.use("Agg")
@@ -56,32 +34,12 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
-
-try:  # Goemans-Williamson SDP (M7 Track A iii)
-    import cvxpy as cp
-
-    CVXPY_AVAILABLE = True
-except ImportError: 
-    cp = None  # type: ignore[assignment]
-    CVXPY_AVAILABLE = False
-
-try:  # Capa geoespacial H3 / H3 geospatial layer (M8)
-    import h3
-
-    H3_AVAILABLE = True
-except ImportError:  
-    h3 = None  # type: ignore[assignment]
-    H3_AVAILABLE = False
-
 logger = logging.getLogger("isla_verde.modelador_red")
 
 
-MERCATOR_R = 6378137.0
-
 # ---------------------------------------------------------------------------
-# M1 - Configuracion / Configuration
+# Configuración
 # ---------------------------------------------------------------------------
-
 
 DEFAULT_INSTANCES: Mapping[str, tuple[str, ...]] = {
     "mvp8": (
@@ -101,14 +59,8 @@ DEFAULT_INSTANCES: Mapping[str, tuple[str, ...]] = {
     ),
 }
 
-# ES: Corredor de respaldo con longitudes reales medidas. Lindora-La Caja se
-#     implementa como DOS circuitos paralelos con pesos sumados
-#     (100000/5860.3 + 100000/5973.5); 5916.9 m es solo la aproximacion
-#     armonica comentada y NO se usa para el peso.
-# EN: Fallback corridor with real measured lengths. Lindora-La Caja is
-#     implemented as TWO parallel circuits with summed weights
-#     (100000/5860.3 + 100000/5973.5); 5916.9 m is only the commented
-#     harmonic approximation and is NOT used for the weight.
+# Corredor de respaldo con longitudes reales medidas.
+# Lindora-La Caja: dos circuitos paralelos con pesos sumados.
 FALLBACK_EDGES_M: tuple[tuple[str, str, float], ...] = (
     ("Arenal", "Garabito", 58158.6),
     ("Arenal", "Lindora", 122582.0),
@@ -116,7 +68,7 @@ FALLBACK_EDGES_M: tuple[tuple[str, str, float], ...] = (
     ("Barranca", "Garabito", 7949.7),
     ("Barranca", "La Garita", 41536.5),
     ("La Garita", "Lindora", 20828.0),
-    ("Lindora", "La Caja", 5916.9),  # par paralelo, ver nota / parallel pair
+    ("Lindora", "La Caja", 5916.9),
     ("La Caja", "Belen", 3733.1),
 )
 FALLBACK_PARALLEL_LENGTHS_M: tuple[float, float] = (5860.3, 5973.5)
@@ -124,6 +76,7 @@ FALLBACK_PARALLEL_LENGTHS_M: tuple[float, float] = (5860.3, 5973.5)
 
 @dataclass(frozen=True)
 class Config:
+    """Configuración inmutable del pipeline."""
     data_dir: Path = Path("/workspace/knowledge/")
     out_dir: Path = Path("/workspace/scratch/")
     seed: int = 42
@@ -133,9 +86,9 @@ class Config:
         default_factory=lambda: dict(DEFAULT_INSTANCES)
     )
     critical_node: str = "La Caja"
-    generator_anchor: str = "Arenal"  # pareja de la restriccion critica / (g)
+    generator_anchor: str = "Arenal"
     generator_anchors: tuple[str, ...] = ("Arenal", "Garabito")
-    generator_shares: tuple[float, ...] = (0.6, 0.4)  # hidro/termico estilizado
+    generator_shares: tuple[float, ...] = (0.6, 0.4)
     h3_resolution: int = 5
     alpha: float | None = None
     beta: float | None = None
@@ -144,7 +97,7 @@ class Config:
 
 
 # ---------------------------------------------------------------------------
-# M2 - Normalizacion de nombres y parseo / Name normalization and parsing
+# Normalización de nombres y parseo de circuitos
 # ---------------------------------------------------------------------------
 
 _PAREN_SUFFIX_RE = re.compile(r"\s*\(.*\)\s*$")
@@ -152,75 +105,68 @@ _TRAILING_DIGITS_RE = re.compile(r"\d+$")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
-def normalize_name(s: str) -> str:
-    """ES: Normalizacion canonica, identica en ambos CSV. Orden exacto: strip
-    -> minusculas -> NFD -> quitar diacriticos -> quitar sufijo entre
-    parentesis -> quitar digitos finales -> colapsar espacios.
-    EN: Canonical normalization, identical on both CSV sides. Exact order:
-    strip -> lowercase -> NFD -> strip combining marks -> strip parenthetical
-    suffix -> strip trailing digits -> collapse whitespace."""
-    s = str(s).strip().lower()
+def _strip_diacritics(s: str) -> str:
+    """Quita diacríticos via NFD + eliminación de combining marks."""
     s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+
+def normalize_name(s: str) -> str:
+    """Normalización canónica para vincular subestaciones entre CSVs."""
+    s = _strip_diacritics(str(s).strip().lower())
     s = _PAREN_SUFFIX_RE.sub("", s)
     s = _TRAILING_DIGITS_RE.sub("", s).strip()
-    s = _WHITESPACE_RE.sub(" ", s)
-    return s
+    return _WHITESPACE_RE.sub(" ", s)
 
 
-def build_name_map(official_names: Iterable[str]) -> dict[str, str]:
-  
+def normalize_province(s: str) -> str:
+    """Normaliza nombre de provincia."""
+    return _WHITESPACE_RE.sub(
+        " ", _strip_diacritics(str(s).strip().lower())
+    ).title()
+
+
+def build_name_map(official_names: list[str]) -> dict[str, str]:
+    """Mapeo nombre_normalizado → nombre_oficial con alias 'la X' → 'X'."""
     name_map: dict[str, str] = {}
     for official in official_names:
         key = normalize_name(official)
         if key in name_map and name_map[key] != official:
             logger.warning(
-                "Colision de normalizacion / normalization collision: "
-                "%r y/and %r -> %r", name_map[key], official, key,
+                "Colisión de normalización: %r y %r → %r",
+                name_map[key], official, key,
             )
         name_map[key] = official
-    for key in sorted(name_map):  # orden estable / stable iteration order
+
+    for key in sorted(name_map):
         if key.startswith("la "):
             alias = key[3:]
             if alias and alias not in name_map:
                 name_map[alias] = name_map[key]
-            elif alias in name_map and name_map[alias] != name_map[key]:
-                logger.warning(
-                    "Alias %r de/for %r colisiona con/collides with %r; "
-                    "se mantiene el existente / keeping existing",
-                    alias, name_map[key], name_map[alias],
-                )
     return name_map
-
-
-class SkipReason(str, Enum):
-    
-
-    NO_HYPHEN = "no-hyphen"
-    UNKNOWN_ENDPOINT = "unknown-endpoint"
 
 
 @dataclass(frozen=True)
 class CircuitResolution:
-
-
+    """Resultado de parsear un nombre de circuito."""
     raw: str
-    status: str  # "ok" o/or valor de SkipReason / SkipReason value
-    endpoints: tuple[str, str] | None = None  # nombres oficiales / official
+    status: str  # "ok", "no-hyphen", "unknown-endpoint"
+    endpoints: tuple[str, str] | None = None
     unknown_endpoints: tuple[str, ...] = ()
 
 
 def parse_circuit(raw: str, name_map: Mapping[str, str]) -> CircuitResolution:
-    
+    """Parsea 'Sub1-Sub2' resolviendo ambos extremos contra name_map."""
     raw = str(raw).strip()
     if "-" not in raw:
-        return CircuitResolution(raw=raw, status=SkipReason.NO_HYPHEN.value)
+        return CircuitResolution(raw=raw, status="no-hyphen")
 
     best_unknown: tuple[str, ...] | None = None
     for pos, ch in enumerate(raw):
         if ch != "-":
             continue
-        left, right = normalize_name(raw[:pos]), normalize_name(raw[pos + 1:])
+        left = normalize_name(raw[:pos])
+        right = normalize_name(raw[pos + 1:])
         if not left or not right:
             continue
         unknown = tuple(k for k in (left, right) if k not in name_map)
@@ -231,32 +177,23 @@ def parse_circuit(raw: str, name_map: Mapping[str, str]) -> CircuitResolution:
             )
         if best_unknown is None or len(unknown) < len(best_unknown):
             best_unknown = unknown
+
     return CircuitResolution(
-        raw=raw,
-        status=SkipReason.UNKNOWN_ENDPOINT.value,
+        raw=raw, status="unknown-endpoint",
         unknown_endpoints=best_unknown or (),
     )
 
 
-def normalize_province(s: str) -> str:
-  
-    s = str(s).strip().lower()
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = _WHITESPACE_RE.sub(" ", s)
-    return s.title()
-
-
 def mercator_to_latlon(x: float, y: float) -> tuple[float, float]:
-    
-    lon = math.degrees(x / MERCATOR_R)
-    lat = math.degrees(math.atan(math.sinh(y / MERCATOR_R)))
+    """Convierte coordenadas Web Mercator a lat/lon."""
+    R = 6_378_137.0
+    lon = math.degrees(x / R)
+    lat = math.degrees(math.atan(math.sinh(y / R)))
     return lat, lon
 
 
 # ---------------------------------------------------------------------------
-# M6 - Algebra QUBO/Ising 
-# M6 - QUBO/Ising algebra 
+# Álgebra QUBO/Ising
 # ---------------------------------------------------------------------------
 
 
@@ -268,136 +205,117 @@ def build_qubo(
     critical_idx: int,
     anchor_idx: int,
 ) -> tuple[np.ndarray, float]:
-
+    """Construye matriz Q del QUBO: H_cut + α·H_balance + β·H_critical."""
     n = balances.shape[0]
-    q_matrix = np.zeros((n, n), dtype=np.float64)
+    Q = np.zeros((n, n), dtype=np.float64)
 
-    # ES: H_cut = -sum W(x_i + x_j - 2 x_i x_j) = -(corte ponderado):
-    #     minimizar MAXIMIZA el peso total cortado (Max-Cut, el benchmark que
-    #     exige el reto). Nota fisica honesta: con W = 1/longitud como proxy
-    #     de acoplamiento, Max-Cut tiende a cortar las lineas MAS acopladas,
-    #     no las debiles; "preservar acoples fuertes y romper solo los
-    #     debiles" seria un Min-Cut restringido, que es un problema distinto.
-    # EN: H_cut = -sum W(x_i + x_j - 2 x_i x_j) = -(weighted cut):
-    #     minimizing MAXIMIZES total cut weight (Max-Cut, the challenge
-    #     benchmark). Honest physics note: with W = 1/length as a coupling
-    #     proxy, Max-Cut tends to sever the MOST strongly coupled lines, not
-    #     the weak ones; "preserve strong couplings, break only weak ones"
-    #     would be a constrained Min-Cut, which is a different problem.
+    # H_cut = -Σ W(x_i + x_j - 2·x_i·x_j): minimizar maximiza el corte
     for i, j, w in edges:
-        q_matrix[i, i] -= w          # parte lineal / linear part -W(x_i+x_j)
-        q_matrix[j, j] -= w
-        q_matrix[i, j] += 2.0 * w    # parte cuadratica / quadratic +2W x_i x_j
+        Q[i, i] -= w
+        Q[j, j] -= w
+        Q[i, j] += 2.0 * w
 
-    # ES: H_balance = alpha*(sum B_i x_i)^2. Con sum B_i = 0 por construccion,
-    #     penalizar la isla A cubre ambas islas. Expansion con x_i^2 = x_i:
-    #     diagonal B_i^2 + cruzados 2 B_i B_j.
-    # EN: H_balance = alpha*(sum B_i x_i)^2. With sum B_i = 0 by construction,
-    #     penalizing island A covers both islands. Expansion with x_i^2 = x_i:
-    #     diagonal B_i^2 + cross terms 2 B_i B_j.
+    # H_balance = α·(Σ B_i·x_i)²
     for i in range(n):
-        q_matrix[i, i] += alpha * balances[i] ** 2   # autodesbalance / self
+        Q[i, i] += alpha * balances[i] ** 2
     for i in range(n):
         for j in range(i + 1, n):
-            q_matrix[i, j] += 2.0 * alpha * balances[i] * balances[j]  # cruz
+            Q[i, j] += 2.0 * alpha * balances[i] * balances[j]
 
-    # ES: H_critical = beta*(x_c - x_g)^2 = beta*(x_c + x_g - 2 x_c x_g):
-    #     cero si carga critica y ancla generadora comparten isla; +beta si no.
-    #     beta se calibra para que violar nunca convenga.
-    # EN: H_critical = beta*(x_c - x_g)^2: zero when critical load and its
-    #     generator anchor share an island, +beta otherwise. beta is
-    #     calibrated so violation can never pay off.
+    # H_critical = β·(x_c - x_g)²
     c, g = critical_idx, anchor_idx
     lo, hi = (c, g) if c < g else (g, c)
-    q_matrix[c, c] += beta
-    q_matrix[g, g] += beta
-    q_matrix[lo, hi] -= 2.0 * beta
+    Q[c, c] += beta
+    Q[g, g] += beta
+    Q[lo, hi] -= 2.0 * beta
 
-  
-    offset = 0.0
-    return q_matrix, offset
+    return Q, 0.0
 
 
 def qubo_to_ising(
-    q_matrix: np.ndarray, qubo_offset: float
+    Q: np.ndarray, qubo_offset: float,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    
-    diag = np.diag(q_matrix).copy()
-    upper = np.triu(q_matrix, k=1)
-    # x_i = (1 - s_i)/2 ; x_i x_j = (1 - s_i - s_j + s_i s_j)/4
+    """Convierte QUBO a Ising via x = (1-s)/2."""
+    diag = np.diag(Q).copy()
+    upper = np.triu(Q, k=1)
     h_vec = -diag / 2.0 - (upper.sum(axis=1) + upper.sum(axis=0)) / 4.0
-    j_upper = upper / 4.0
+    J_upper = upper / 4.0
     offset = qubo_offset + diag.sum() / 2.0 + upper.sum() / 4.0
-    return h_vec, j_upper, offset
+    return h_vec, J_upper, offset
 
 
 def qubo_energies(
-    q_matrix: np.ndarray, offset: float, x_batch: np.ndarray
+    Q: np.ndarray, offset: float, x_batch: np.ndarray,
 ) -> np.ndarray:
-    """ES: E(x) = x^T Q x + offset para un lote de filas binarias (m, n).
-    EN: E(x) = x^T Q x + offset for a batch of binary rows (m, n)."""
+    """E(x) = x^T·Q·x + offset para lote de filas binarias (m, n)."""
     x = x_batch.astype(np.float64)
-    return ((x @ q_matrix) * x).sum(axis=1) + offset
+    return ((x @ Q) * x).sum(axis=1) + offset
 
 
 def ising_energies(
-    h_vec: np.ndarray, j_upper: np.ndarray, offset: float, s_batch: np.ndarray
+    h: np.ndarray, J: np.ndarray, offset: float, s_batch: np.ndarray,
 ) -> np.ndarray:
-    """ES: E(s) = h.s + s^T J s + offset para un lote de espines (m, n).
-    EN: E(s) = h.s + s^T J s + offset for a batch of spin rows (m, n)."""
+    """E(s) = h·s + s^T·J·s + offset para lote de espines (m, n)."""
     s = s_batch.astype(np.float64)
-    return ((s @ j_upper) * s).sum(axis=1) + s @ h_vec + offset
+    return ((s @ J) * s).sum(axis=1) + s @ h + offset
 
 
-def enumerate_bitstrings(n_vars: int, fix_first_zero: bool = False) -> np.ndarray:
- 
-    free = n_vars - 1 if fix_first_zero else n_vars
+def enumerate_bitstrings(n: int, fix_first_zero: bool = False) -> np.ndarray:
+    """Genera todas las 2^n (o 2^(n-1) si fix_first_zero) asignaciones."""
+    free = n - 1 if fix_first_zero else n
     ints = np.arange(1 << free, dtype=np.uint64)
-    bits = ((ints[:, None] >> np.arange(free, dtype=np.uint64)[None, :]) & 1)
-    bits = bits.astype(np.float64)
+    bits = (
+        (ints[:, None] >> np.arange(free, dtype=np.uint64)[None, :]) & 1
+    ).astype(np.float64)
     if fix_first_zero:
         bits = np.hstack([np.zeros((bits.shape[0], 1)), bits])
     return bits
 
 
 def cut_values(
-    edges: Sequence[tuple[int, int, float]], x_batch: np.ndarray
+    edges: Sequence[tuple[int, int, float]], x_batch: np.ndarray,
 ) -> np.ndarray:
-    """ES: Corte ponderado sum_e W_e (x_i + x_j - 2 x_i x_j) por lote.
-    EN: Weighted cut sum_e W_e (x_i + x_j - 2 x_i x_j) for a batch of rows."""
+    """Corte ponderado Σ W(x_i + x_j - 2·x_i·x_j) por lote."""
     x = x_batch.astype(np.float64)
     total = np.zeros(x.shape[0], dtype=np.float64)
     for i, j, w in edges:
-        xi, xj = x[:, i], x[:, j]
-        total += w * (xi + xj - 2.0 * xi * xj)
+        total += w * (x[:, i] + x[:, j] - 2.0 * x[:, i] * x[:, j])
     return total
 
 
-def bitstring(x_vec: np.ndarray) -> str:
-    """ES: Vector binario como cadena '01...' en el orden de variables.
-    EN: Binary vector as a '01...' string in variable order."""
-    return "".join(str(int(round(b))) for b in x_vec)
+def bitstring(x: np.ndarray) -> str:
+    """Vector binario como cadena '01...'."""
+    return "".join(str(int(round(b))) for b in x)
+
+
+def build_maxcut_ising(
+    edges: Sequence[tuple[int, int, float]], n: int,
+) -> tuple[np.ndarray, float]:
+    """Ising de Max-Cut puro (h=0, J=w/2) para benchmark QAOA."""
+    J = np.zeros((n, n))
+    for i, j, w in edges:
+        J[i, j] += w / 2.0
+    offset = -float(sum(w for _, _, w in edges)) / 2.0
+    return J, offset
 
 
 class CalibrationError(RuntimeError):
-    """ES: La restriccion critica no se pudo imponer duplicando beta.
-    EN: Critical constraint could not be enforced by doubling beta."""
+    """La restricción crítica no se pudo imponer duplicando β."""
 
 
 # ---------------------------------------------------------------------------
-# Orquestador / Orchestrator
+# Modelo de instancia
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class InstanceModel:
-   
-
+    """Modelo completo de una instancia NISQ."""
     tier: str
     variable_order: list[str]
     graph: nx.Graph
-    edges_idx: list[tuple[int, int, float]]  # (i, j, W_ij), i < j
-    balances: np.ndarray                     # B_i en orden de variables, suma 0
+    edges_idx: list[tuple[int, int, float]]
+    balances: np.ndarray
     alpha: float
     beta: float
     q_matrix: np.ndarray
@@ -405,19 +323,25 @@ class InstanceModel:
     h_vec: np.ndarray
     j_upper: np.ndarray
     ising_offset: float
-    h_total_energies: np.ndarray             # tabla 2^n completa / full table
+    maxcut_j: np.ndarray
+    maxcut_offset: float
+    h_total_energies: np.ndarray
     h_total_optimum: float
     h_total_argmin: np.ndarray
     critical_satisfied: bool
     baselines: dict[str, Any] = field(default_factory=dict)
 
 
-class ICEPowerGridModeler:
+# ---------------------------------------------------------------------------
+# Orquestador principal
+# ---------------------------------------------------------------------------
 
+
+class ICEPowerGridModeler:
+    """Pipeline: CSV → grafo → QUBO/Ising → baselines → export."""
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        # ES: Unico RNG del programa. / EN: Single program-wide RNG.
         self.rng = np.random.default_rng(cfg.seed)
         self.source: str = "real"
         self.graph: nx.Graph = nx.Graph()
@@ -425,116 +349,82 @@ class ICEPowerGridModeler:
         self.instances: dict[str, InstanceModel] = {}
         self.instance_errors: dict[str, str] = {}
         self.checks: list[tuple[int, str, str, bool | None, str]] = []
-        # (numero, descripcion, "hard"/"soft", paso(None=omitido), detalle)
-        # (number, description, "hard"/"soft", passed(None=skipped), detail)
 
-    # -- M2/M3 ----------------------------------------------------------------
+    # -- Ingesta y grafo ------------------------------------------------------
 
     def load_data(self) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-        
+        """Lee los CSV oficiales del ICE. Retorna None si no se encuentran."""
         subs_path = self.cfg.data_dir / self.cfg.subs_filename
         lines_path = self.cfg.data_dir / self.cfg.lines_filename
         try:
-            # ES: utf-8-sig: ambos archivos traen BOM. / EN: both carry a BOM.
             subs = pd.read_csv(subs_path, encoding="utf-8-sig")
             lines = pd.read_csv(lines_path, encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError, pd.errors.ParserError) as exc:
-            logger.warning("Fallo al leer CSV / CSV load failed (%s: %s)",
-                           type(exc).__name__, exc)
+            logger.warning("Fallo al leer CSV (%s: %s)", type(exc).__name__, exc)
             return None
 
         required_subs = {"X", "Y", "Subestacio", "Provincia"}
         required_lines = {"Voltaje", "Circuito", "Shape__Length"}
-        missing_subs = required_subs - set(subs.columns)
-        missing_lines = required_lines - set(lines.columns)
-        if missing_subs or missing_lines:
-            # ES: Nombrar esperado vs encontrado; jamas adivinar una columna.
-            # EN: Name expected vs found; never guess a substitute column.
+        missing_s = required_subs - set(subs.columns)
+        missing_l = required_lines - set(lines.columns)
+        if missing_s or missing_l:
             raise ValueError(
-                "Columnas requeridas ausentes / required columns missing. "
-                f"{self.cfg.subs_filename}: expected {sorted(required_subs)}, "
-                f"found {sorted(subs.columns)}; "
-                f"{self.cfg.lines_filename}: expected {sorted(required_lines)}, "
-                f"found {sorted(lines.columns)}"
+                f"Columnas requeridas ausentes. "
+                f"{self.cfg.subs_filename}: esperado {sorted(required_subs)}, "
+                f"encontrado {sorted(subs.columns)}; "
+                f"{self.cfg.lines_filename}: esperado {sorted(required_lines)}, "
+                f"encontrado {sorted(lines.columns)}"
             )
-        # ES: SHAPE_STLe es inconfiable (razon 0.005-4.9 vs Shape__Length) y
-        #     deliberadamente nunca se lee.
-        # EN: SHAPE_STLe is unreliable (0.005-4.9 ratio vs Shape__Length) and
-        #     is deliberately never read.
         return subs, lines
 
     def build_graph(self, subs: pd.DataFrame, lines: pd.DataFrame) -> None:
-        """ES: M3: filtro 230 kV, resolucion de extremos, pesos, fusion de
-        circuitos paralelos.
-        EN: M3: 230 kV filter, endpoint resolution, weights, parallel merge."""
+        """Construye grafo 230kV: nodos=subestaciones, aristas=líneas."""
         cfg = self.cfg
         name_map = build_name_map(subs["Subestacio"].tolist())
-
         graph = nx.Graph()
+
         for _, row in subs.iterrows():
             lat, lon = mercator_to_latlon(float(row["X"]), float(row["Y"]))
             graph.add_node(
                 str(row["Subestacio"]),
                 province=normalize_province(row["Provincia"]),
-                x_merc=float(row["X"]),
-                y_merc=float(row["Y"]),
-                lat=lat,
-                lon=lon,
+                x_merc=float(row["X"]), y_merc=float(row["Y"]),
+                lat=lat, lon=lon,
             )
 
         filtered = lines[lines["Voltaje"] == cfg.voltage]
         logger.info(
-            "Filtradas / filtered %d/%d filas de circuito a %d kV",
+            "Filtradas %d/%d filas a %d kV",
             len(filtered), len(lines), cfg.voltage,
         )
+
         for _, row in filtered.iterrows():
-            resolution = parse_circuit(row["Circuito"], name_map)
-            if resolution.status != "ok":
-                self.excluded.append(resolution)
-                logger.warning(
-                    "Circuito excluido / excluded circuit %r (%s%s)",
-                    resolution.raw, resolution.status,
-                    f": {', '.join(resolution.unknown_endpoints)}"
-                    if resolution.unknown_endpoints else "",
-                )
+            res = parse_circuit(row["Circuito"], name_map)
+            if res.status != "ok":
+                self.excluded.append(res)
                 continue
-            u, v = resolution.endpoints  # type: ignore[misc]
-            length_m = float(row["Shape__Length"])  # longitud oficial / authoritative
+            u, v = res.endpoints  # type: ignore[misc]
+            length_m = float(row["Shape__Length"])
             weight = cfg.weight_numerator / length_m
+
             if graph.has_edge(u, v):
-                # ES: Circuitos paralelos: las capacidades de transferencia se
-                #     suman, asi que los pesos se SUMAN en una sola arista.
-                # EN: Parallel circuits: transfer capacities add, so weights
-                #     are SUMMED into one edge.
+                # Circuitos paralelos: capacidades se suman
                 data = graph[u][v]
                 data["weight"] += weight
-                data["circuits"].append(resolution.raw)
+                data["circuits"].append(res.raw)
                 data["lengths_m"].append(length_m)
                 data["parallel"] = True
             else:
                 graph.add_edge(
-                    u, v,
-                    weight=weight,
-                    circuits=[resolution.raw],
-                    lengths_m=[length_m],
-                    parallel=False,
+                    u, v, weight=weight, circuits=[res.raw],
+                    lengths_m=[length_m], parallel=False,
                 )
 
-        # ES: Quitar subestaciones sin circuito 230 kV (solo 138 kV o aisladas
-        #     a este nivel de tension; irrelevantes para el modelo).
-        # EN: Drop substations with no 230 kV circuit (138 kV-only or isolated
-        #     at this voltage level; irrelevant to the model).
+        # Quitar subestaciones sin circuito a este nivel de tensión
         isolated = [n for n in graph.nodes if graph.degree(n) == 0]
         graph.remove_nodes_from(isolated)
-        logger.info("Eliminadas / dropped %d subestaciones sin circuito %d kV",
-                    len(isolated), cfg.voltage)
 
-        # ES: Longitud equivalente por arista: numerador / peso sumado. Para
-        #     una linea es la longitud medida; para paralelas es la combinacion
-        #     armonica, consistente con impedancias en paralelo.
-        # EN: Equivalent length per edge: numerator / summed weight. Single
-        #     circuit -> measured length; parallels -> harmonic combination,
-        #     consistent with impedances in parallel.
+        # Longitud equivalente: numerador / peso sumado
         for _, _, data in graph.edges(data=True):
             data["length_m"] = cfg.weight_numerator / data["weight"]
 
@@ -542,37 +432,33 @@ class ICEPowerGridModeler:
         self._check_graph_invariants()
 
     def _check_graph_invariants(self) -> None:
-        graph = self.graph
-        n_nodes, n_edges = graph.number_of_nodes(), graph.number_of_edges()
-        connected = nx.is_connected(graph) if n_nodes else False
-        n_parallel = sum(
-            1 for _, _, d in graph.edges(data=True) if d["parallel"]
+        """Verifica invariantes esperadas del grafo completo."""
+        g = self.graph
+        actual = (
+            g.number_of_nodes(), g.number_of_edges(),
+            nx.is_connected(g) if g.number_of_nodes() else False,
+            sum(1 for _, _, d in g.edges(data=True) if d["parallel"]),
+            len(self.excluded),
         )
-        n_excluded = len(self.excluded)
         expected = (46, 58, True, 3, 4)
-        actual = (n_nodes, n_edges, connected, n_parallel, n_excluded)
-        if actual != expected:
-            logger.warning(
-                "Deriva de invariantes / invariant drift: esperado/expected "
-                "(nodes, edges, connected, parallel, exclusions)=%s, "
-                "obtenido/got %s", expected, actual,
-            )
-        else:
-            logger.info(
-                "Invariantes del grafo OK / graph invariants hold: 46 nodos, "
-                "58 aristas, conexo, 3 pares paralelos, 4 circuitos excluidos"
-            )
         ok = actual == expected
-        detail = f"expected {expected}, got {actual}"
-        self.checks.append((8, "Full-graph invariants (46/58/connected/3/4)",
-                            "soft", ok, detail))
+        if not ok:
+            logger.warning(
+                "Deriva de invariantes: esperado %s, obtenido %s",
+                expected, actual,
+            )
+        self.checks.append((
+            8, "Invariantes del grafo (46/58/conexo/3/4)",
+            "soft", ok, f"esperado {expected}, obtenido {actual}",
+        ))
 
     def build_fallback_graph(self) -> None:
-      
-        logger.warning("[FALLBACK] Using synthetic ICE 230 kV corridor proxy")
+        """Grafo sintético de respaldo basado en corredor ICE 230kV."""
+        logger.warning("[FALLBACK] Usando proxy sintético del corredor ICE 230kV")
         self.source = "fallback"
         cfg = self.cfg
         graph = nx.Graph()
+
         for u, v, length_m in FALLBACK_EDGES_M:
             if (u, v) == ("Lindora", "La Caja"):
                 l1, l2 = FALLBACK_PARALLEL_LENGTHS_M
@@ -589,22 +475,23 @@ class ICEPowerGridModeler:
                     circuits=[f"{u}-{v}"], lengths_m=[length_m],
                     parallel=False, length_m=length_m,
                 )
-      
+
         pos = nx.spring_layout(graph, seed=cfg.seed)
         for node in graph.nodes:
-            graph.nodes[node]["province"] = "Sintetica"
-            graph.nodes[node]["x_merc"] = float(pos[node][0])
-            graph.nodes[node]["y_merc"] = float(pos[node][1])
-            graph.nodes[node]["lat"] = 0.0
-            graph.nodes[node]["lon"] = 0.0
+            graph.nodes[node].update(
+                province="Sintética", lat=0.0, lon=0.0,
+                x_merc=float(pos[node][0]), y_merc=float(pos[node][1]),
+            )
         self.graph = graph
-        self.checks.append((8, "Full-graph invariants (46/58/connected/3/4)",
-                            "soft", None, "skipped: fallback proxy in use"))
+        self.checks.append((
+            8, "Invariantes del grafo (46/58/conexo/3/4)",
+            "soft", None, "omitido: proxy de respaldo activo",
+        ))
 
-    # -- M4 -------------------------------------------------------------------
+    # -- Extracción de instancias ---------------------------------------------
 
     def extract_instances(self) -> dict[str, nx.Graph]:
-        
+        """Extrae subgrafos inducidos para cada tier de instancia."""
         subgraphs: dict[str, nx.Graph] = {}
         for tier, node_set in self.cfg.instances.items():
             missing = [n for n in node_set if n not in self.graph]
@@ -613,42 +500,39 @@ class ICEPowerGridModeler:
                     n: difflib.get_close_matches(n, list(self.graph.nodes), n=3)
                     for n in missing
                 }
-                message = f"unresolved nodes {missing}; closest: {suggestions}"
-                self.instance_errors[tier] = message
-                logger.error("Instancia %s omitida / skipped: %s", tier, message)
+                msg = f"nodos no resueltos {missing}; cercanos: {suggestions}"
+                self.instance_errors[tier] = msg
+                logger.error("Instancia %s omitida: %s", tier, msg)
                 continue
-            subgraph = nx.Graph(self.graph.subgraph(node_set))
-            if not nx.is_connected(subgraph):
-                components = [sorted(c) for c in nx.connected_components(subgraph)]
+            sub = nx.Graph(self.graph.subgraph(node_set))
+            if not nx.is_connected(sub):
+                components = [sorted(c) for c in nx.connected_components(sub)]
                 raise AssertionError(
-                    f"Instancia/instance {tier} desconectada/disconnected "
-                    f"(componentes/components: {components}); los conjuntos "
-                    "estan verificados: el procesamiento previo se rompio / "
-                    "node sets are spec-verified, upstream processing broke"
+                    f"Instancia {tier} desconectada: {components}"
                 )
-            subgraphs[tier] = subgraph
+            subgraphs[tier] = sub
             logger.info(
-                "Instancia / instance %s: %d nodos, %d aristas inducidas, conexa",
-                tier, subgraph.number_of_nodes(), subgraph.number_of_edges(),
+                "Instancia %s: %d nodos, %d aristas, conexa",
+                tier, sub.number_of_nodes(), sub.number_of_edges(),
             )
         return subgraphs
 
-    # -- M5 -------------------------------------------------------------------
+    # -- Balance de potencia sintético ----------------------------------------
 
     def assign_balances(self, nodes: Sequence[str]) -> dict[str, float]:
-      
+        """Asigna balance generación-demanda sintético con suma cero exacta."""
         anchors = [a for a in self.cfg.generator_anchors if a in nodes]
         if not anchors:
             raise ValueError(
-                f"Ningun ancla de generacion / no generator anchor of "
-                f"{self.cfg.generator_anchors} present in {sorted(nodes)}"
+                f"Ningún ancla generadora de {self.cfg.generator_anchors} "
+                f"presente en {sorted(nodes)}"
             )
         shares = np.array(
             [s for a, s in zip(self.cfg.generator_anchors,
                                self.cfg.generator_shares) if a in nodes],
             dtype=np.float64,
         )
-        shares = shares / shares.sum()
+        shares /= shares.sum()
 
         load_nodes = sorted(n for n in nodes if n not in anchors)
         draws = self.rng.uniform(50.0, 150.0, size=len(load_nodes))
@@ -657,20 +541,18 @@ class ICEPowerGridModeler:
         balances = {n: -float(d) for n, d in zip(load_nodes, draws)}
         for anchor, share in zip(anchors, shares):
             balances[anchor] = float(share) * total_load
-        residual = math.fsum(balances.values())
-        balances[load_nodes[-1]] -= residual  # suma cero exacta / exact zero
+        balances[load_nodes[-1]] -= math.fsum(balances.values())
         assert abs(math.fsum(balances.values())) < 1e-9
         return balances
 
-    # -- M6 -------------------------------------------------------------------
+    # -- Formulación QUBO/Ising -----------------------------------------------
 
     def formulate_instance(self, tier: str, subgraph: nx.Graph) -> InstanceModel:
-       
+        """Formula QUBO/Ising con auto-calibración de β."""
         cfg = self.cfg
-        # ES: Orden fijo = nombres ordenados, registrado en el export.
-        # EN: Fixed order = sorted node names, recorded in the export.
         variable_order = sorted(subgraph.nodes)
         index = {name: i for i, name in enumerate(variable_order)}
+
         edges_idx = sorted(
             (min(index[u], index[v]), max(index[u], index[v]),
              float(d["weight"]))
@@ -680,105 +562,86 @@ class ICEPowerGridModeler:
         balances = np.array([balance_map[n] for n in variable_order])
 
         total_weight = float(sum(w for _, _, w in edges_idx))
-        sum_b_squared = float((balances ** 2).sum())
-        alpha = cfg.alpha if cfg.alpha is not None else (
-            total_weight / (sum_b_squared / 4.0)  # Var analitica / analytic
-        )
+        sum_b2 = float((balances ** 2).sum())
+        alpha = (cfg.alpha if cfg.alpha is not None
+                 else total_weight / (sum_b2 / 4.0))
         beta = cfg.beta if cfg.beta is not None else 2.0 * total_weight
-        if beta < 2.0 * total_weight:
-            logger.warning(
-                "[%s] beta configurado %.6g bajo el piso de seguridad / "
-                "configured beta below safety floor 2*sumW=%.6g",
-                tier, beta, 2.0 * total_weight,
-            )
 
         critical_idx = index[cfg.critical_node]
         anchor_idx = index[cfg.generator_anchor]
-        n_vars = len(variable_order)
-        all_states = enumerate_bitstrings(n_vars)
+        n = len(variable_order)
+        all_states = enumerate_bitstrings(n)
 
-        q_matrix = np.zeros((0, 0))
-        qubo_offset = 0.0
+        # Auto-calibración: duplicar β hasta satisfacer restricción crítica
+        MAX_DOUBLINGS = 3
+        satisfied = False
+        Q = np.zeros((0, 0))
+        q_offset = 0.0
         energies = np.zeros(0)
         argmin_x = np.zeros(0)
-        satisfied = False
-        for attempt in range(4):  # solve inicial + max 3 duplicaciones / doublings
-            q_matrix, qubo_offset = build_qubo(
-                edges_idx, balances, alpha, beta, critical_idx, anchor_idx
+
+        for attempt in range(1 + MAX_DOUBLINGS):
+            Q, q_offset = build_qubo(
+                edges_idx, balances, alpha, beta, critical_idx, anchor_idx,
             )
-            energies = qubo_energies(q_matrix, qubo_offset, all_states)
+            energies = qubo_energies(Q, q_offset, all_states)
             argmin_x = all_states[int(np.argmin(energies))]
             satisfied = bool(argmin_x[critical_idx] == argmin_x[anchor_idx])
             if satisfied:
                 break
-            logger.warning(
-                "[%s] restriccion critica violada en el optimo con beta=%.6g; "
-                "duplicando / critical constraint violated, doubling "
-                "(intento/attempt %d/3)", tier, beta, attempt + 1,
-            )
-            beta *= 2.0
+            if attempt < MAX_DOUBLINGS:
+                logger.warning(
+                    "[%s] restriccion critica violada con beta=%.6g, "
+                    "duplicando (intento %d/%d)",
+                    tier, beta, attempt + 1, MAX_DOUBLINGS,
+                )
+                beta *= 2.0
+
         if not satisfied:
             raise CalibrationError(
-                f"[{tier}] x_c == x_g insatisfecha tras 3 duplicaciones de "
-                f"beta / unsatisfied after 3 beta doublings (beta={beta:.6g}, "
-                f"alpha={alpha:.6g}, sum W={total_weight:.6g}, "
-                f"optimum={float(energies.min()):.6g}, "
-                f"bitstring={bitstring(argmin_x)}, "
-                f"c={cfg.critical_node}, g={cfg.generator_anchor})"
+                f"[{tier}] x_c == x_g insatisfecha tras {MAX_DOUBLINGS} "
+                f"duplicaciones de beta (beta={beta:.6g}, alpha={alpha:.6g})"
             )
-        logger.info(
-            "[%s] calibrado / calibrated alpha=%.6g beta=%.6g "
-            "(sum W=%.6g, sum B^2=%.6g)",
-            tier, alpha, beta, total_weight, sum_b_squared,
-        )
 
-        h_vec, j_upper, ising_offset = qubo_to_ising(q_matrix, qubo_offset)
+        h_vec, j_upper, ising_offset = qubo_to_ising(Q, q_offset)
+        mc_j, mc_offset = build_maxcut_ising(edges_idx, n)
+
         return InstanceModel(
-            tier=tier,
-            variable_order=variable_order,
-            graph=subgraph,
-            edges_idx=edges_idx,
-            balances=balances,
-            alpha=alpha,
-            beta=beta,
-            q_matrix=q_matrix,
-            qubo_offset=qubo_offset,
-            h_vec=h_vec,
-            j_upper=j_upper,
-            ising_offset=ising_offset,
+            tier=tier, variable_order=variable_order, graph=subgraph,
+            edges_idx=edges_idx, balances=balances, alpha=alpha, beta=beta,
+            q_matrix=Q, qubo_offset=q_offset,
+            h_vec=h_vec, j_upper=j_upper, ising_offset=ising_offset,
+            maxcut_j=mc_j, maxcut_offset=mc_offset,
             h_total_energies=energies,
             h_total_optimum=float(energies.min()),
             h_total_argmin=argmin_x,
             critical_satisfied=satisfied,
         )
 
-    # -- M7 -------------------------------------------------------------------
+    # -- Líneas base clásicas -------------------------------------------------
 
     def compute_baselines(self, model: InstanceModel) -> None:
-     
-        n_vars = len(model.variable_order)
+        """Calcula fuerza bruta, greedy y Goemans-Williamson."""
+        n = len(model.variable_order)
         edges = model.edges_idx
 
-        # (i) ES: fuerza bruta exacta sobre 2^(n-1), x_0 fijo en 0.
-        #     EN: exact brute force over 2^(n-1) states, x_0 fixed to 0.
-        half_states = enumerate_bitstrings(n_vars, fix_first_zero=True)
-        cuts = cut_values(edges, half_states)
+        # Fuerza bruta sobre 2^(n-1), x_0 fijo en 0
+        half = enumerate_bitstrings(n, fix_first_zero=True)
+        cuts = cut_values(edges, half)
         best_idx = int(np.argmax(cuts))
-        brute_cut = float(cuts[best_idx])
-        brute_x = half_states[best_idx]
+        brute_cut, brute_x = float(cuts[best_idx]), half[best_idx]
 
-        # (ii) ES: greedy: inicio aleatorio sembrado + mejor flip individual.
-        #      EN: greedy: seeded random start + best-improvement single flips.
-        greedy_cut, greedy_x = self._greedy_maxcut(edges, n_vars)
-
-        # (iii) ES: GW via relajacion SDP, mejor de 50 redondeos.
-        #       EN: GW via SDP relaxation, best of 50 roundings.
-        gw_result = self._goemans_williamson(edges, n_vars, roundings=50)
+        greedy_cut, greedy_x = self._greedy_maxcut(edges, n)
+        gw_result = self._goemans_williamson(edges, n, roundings=50)
 
         model.baselines = {
             "maxcut": {
-                "brute_force": {"cut": brute_cut, "bitstring": bitstring(brute_x)},
-                "greedy": {"cut": greedy_cut, "bitstring": bitstring(greedy_x)},
+                "brute_force": {
+                    "cut": brute_cut, "bitstring": bitstring(brute_x),
+                },
+                "greedy": {
+                    "cut": greedy_cut, "bitstring": bitstring(greedy_x),
+                },
                 "goemans_williamson": gw_result,
             },
             "h_total": {
@@ -787,182 +650,137 @@ class ICEPowerGridModeler:
                 "critical_constraint_satisfied": model.critical_satisfied,
             },
         }
-        gw_text = ("unavailable" if gw_result is None
-                   else f"{gw_result['cut']:.4f}")
         logger.info(
-            "[%s] baselines: brute cut=%.4f greedy=%.4f GW=%s | "
-            "H_total optimum=%.4f",
-            model.tier, brute_cut, greedy_cut, gw_text, model.h_total_optimum,
+            "[%s] baselines: brute=%.4f greedy=%.4f GW=%.4f | H_total=%.4f",
+            model.tier, brute_cut, greedy_cut, gw_result["cut"],
+            model.h_total_optimum,
         )
 
     def _greedy_maxcut(
-        self, edges: Sequence[tuple[int, int, float]], n_vars: int
+        self, edges: Sequence[tuple[int, int, float]], n: int,
     ) -> tuple[float, np.ndarray]:
-        
-        x = self.rng.integers(0, 2, size=n_vars).astype(np.float64)
-        incident: list[list[tuple[int, float]]] = [[] for _ in range(n_vars)]
+        """Greedy: inicio aleatorio + mejor flip individual."""
+        x = self.rng.integers(0, 2, size=n).astype(np.float64)
+        incident: list[list[tuple[int, float]]] = [[] for _ in range(n)]
         for i, j, w in edges:
             incident[i].append((j, w))
             incident[j].append((i, w))
-        # ES: Cota generosa; el lazo sale antes. / EN: generous bound; exits early.
-        for _ in range(10 * (1 << n_vars)):
+
+        for _ in range(10 * (1 << n)):
             gains = np.array([
                 sum(w if x[i] == x[j] else -w for j, w in incident[i])
-                for i in range(n_vars)
+                for i in range(n)
             ])
             best = int(np.argmax(gains))
             if gains[best] <= 1e-12:
                 break
             x[best] = 1.0 - x[best]
+
         if x[0] == 1.0:
             x = 1.0 - x
-        cut = float(cut_values(edges, x[None, :])[0])
-        return cut, x
+        return float(cut_values(edges, x[None, :])[0]), x
 
     def _goemans_williamson(
-        self, edges: Sequence[tuple[int, int, float]], n_vars: int,
+        self, edges: Sequence[tuple[int, int, float]], n: int,
         roundings: int,
-    ) -> dict[str, Any] | None:
-       
-        if not CVXPY_AVAILABLE:
-            logger.warning(
-                "cvxpy no disponible / unavailable: GW baseline = null"
-            )
-            return None
-        try:
-            gram = cp.Variable((n_vars, n_vars), symmetric=True)
-            constraints = [gram >> 0, cp.diag(gram) == 1]
-            objective = cp.Maximize(
-                sum(w * (1 - gram[i, j]) for i, j, w in edges) / 2
-            )
-            problem = cp.Problem(objective, constraints)
-            problem.solve(solver=cp.SCS, verbose=False)
-            if gram.value is None:
-                raise RuntimeError(f"SDP sin solucion / solver returned no "
-                                   f"value (status: {problem.status})")
-        except Exception as exc:  # disponibilidad de solver varia / env varies
-            logger.warning(
-                "GW SDP fallo / failed (%s: %s); resultado null",
-                type(exc).__name__, exc,
-            )
-            return None
+    ) -> dict[str, Any]:
+        """Goemans-Williamson via relajación SDP + redondeo aleatorio."""
+        gram = cp.Variable((n, n), symmetric=True)
+        constraints = [gram >> 0, cp.diag(gram) == 1]
+        objective = cp.Maximize(
+            sum(w * (1 - gram[i, j]) for i, j, w in edges) / 2
+        )
+        problem = cp.Problem(objective, constraints)
+        problem.solve(solver=cp.SCS, verbose=False)
 
-        gram_value = np.asarray((gram.value + gram.value.T) / 2.0)
-        eigvals, eigvecs = np.linalg.eigh(gram_value)
+        if gram.value is None:
+            raise RuntimeError(
+                f"SDP sin solución (status: {problem.status})"
+            )
+
+        G = np.asarray((gram.value + gram.value.T) / 2.0)
+        eigvals, eigvecs = np.linalg.eigh(G)
         vectors = eigvecs * np.sqrt(np.clip(eigvals, 0.0, None))
 
-        best_cut = -np.inf
-        best_x = np.zeros(n_vars)
+        best_cut, best_x = -np.inf, np.zeros(n)
         for _ in range(roundings):
-            hyperplane = self.rng.standard_normal(n_vars)
+            hyperplane = self.rng.standard_normal(n)
             signs = np.sign(vectors @ hyperplane)
             signs[signs == 0] = 1.0
             x = (1.0 - signs) / 2.0
-            # ES: Canonizar: el corte es invariante al complemento.
-            # EN: Canonicalize: cut invariant under complement.
             if x[0] == 1.0:
                 x = 1.0 - x
             cut = float(cut_values(edges, x[None, :])[0])
             if cut > best_cut:
                 best_cut, best_x = cut, x
+
         return {
-            "cut": best_cut,
-            "bitstring": bitstring(best_x),
+            "cut": best_cut, "bitstring": bitstring(best_x),
             "roundings": roundings,
         }
 
-    # -- M8 -------------------------------------------------------------------
+    # -- Capa geoespacial H3 --------------------------------------------------
 
     def build_h3_layer(self) -> dict[str, Any] | None:
-       
-        if not H3_AVAILABLE:
-            logger.warning("h3 no disponible / unavailable: capa omitida / skipped")
-            return None
+        """Agrega subestaciones por celda hexagonal H3."""
         if self.source == "fallback":
-            logger.warning("Fallback sin coordenadas reales / no real "
-                           "coordinates: H3 omitido / skipped")
-            return None
-        try:
-            # ES: Nombres de API h3 v4 / v3. / EN: h3 v4 / v3 API names.
-            latlng_to_cell = getattr(h3, "latlng_to_cell", None) or getattr(
-                h3, "geo_to_h3"
-            )
-            # ES: Balances sinteticos del grafo completo, mismo RNG unico
-            #     (determinista: corre despues de todas las instancias).
-            # EN: Full-graph synthetic balances, same single RNG
-            #     (deterministic: runs after all instances are formulated).
-            balances = self.assign_balances(sorted(self.graph.nodes))
-
-            cell_members: dict[str, list[str]] = {}
-            for node in sorted(self.graph.nodes):
-                data = self.graph.nodes[node]
-                cell = str(latlng_to_cell(
-                    data["lat"], data["lon"], self.cfg.h3_resolution
-                ))
-                cell_members.setdefault(cell, []).append(node)
-
-            node_cell = {n: c for c, ms in cell_members.items() for n in ms}
-            super_edges: dict[tuple[str, str], dict[str, Any]] = {}
-            for u, v, data in self.graph.edges(data=True):
-                cu, cv = node_cell[u], node_cell[v]
-                if cu == cv:
-                    # ES: Circuito interno al supernodo. / EN: co-cell circuit.
-                    continue
-                key = (min(cu, cv), max(cu, cv))
-                entry = super_edges.setdefault(
-                    key, {"weight": 0.0, "circuits": []}
-                )
-                entry["weight"] += float(data["weight"])
-                entry["circuits"].extend(data["circuits"])
-
-            layer = {
-                "h3_resolution": self.cfg.h3_resolution,
-                "note": (
-                    "Scaling proposal only. Supernode edges derive exclusively "
-                    "from physical 230 kV lines crossing cell boundaries; H3 "
-                    "adjacency is NOT electrical connection. B values are "
-                    "synthetic."
-                ),
-                "supernodes": [
-                    {
-                        "cell": cell,
-                        "members": members,
-                        "B": math.fsum(balances[m] for m in members),
-                        "synthetic": True,
-                    }
-                    for cell, members in sorted(cell_members.items())
-                ],
-                "superedges": [
-                    {"u": u, "v": v,
-                     "weight": entry["weight"], "circuits": entry["circuits"]}
-                    for (u, v), entry in sorted(super_edges.items())
-                ],
-            }
-            multi = [c for c, ms in cell_members.items() if len(ms) > 1]
-            logger.info(
-                "Capa H3 / H3 layer (res %d): %d supernodos (%d multimiembro), "
-                "%d superaristas de %d circuitos fisicos",
-                self.cfg.h3_resolution, len(cell_members), len(multi),
-                len(super_edges), self.graph.number_of_edges(),
-            )
-            return layer
-        except Exception as exc:  # capa opcional: degradar / degrade, never crash
-            logger.warning(
-                "Capa H3 fallo / H3 layer failed (%s: %s); omitida / skipped",
-                type(exc).__name__, exc,
-            )
+            logger.warning("Fallback sin coordenadas reales: H3 omitido")
             return None
 
-    # -- M9 -------------------------------------------------------------------
+        balances = self.assign_balances(sorted(self.graph.nodes))
+
+        cell_members: dict[str, list[str]] = {}
+        for node in sorted(self.graph.nodes):
+            data = self.graph.nodes[node]
+            cell = str(h3.latlng_to_cell(
+                data["lat"], data["lon"], self.cfg.h3_resolution,
+            ))
+            cell_members.setdefault(cell, []).append(node)
+
+        node_cell = {n: c for c, ms in cell_members.items() for n in ms}
+        super_edges: dict[tuple[str, str], dict[str, Any]] = {}
+        for u, v, data in self.graph.edges(data=True):
+            cu, cv = node_cell[u], node_cell[v]
+            if cu == cv:
+                continue
+            key = (min(cu, cv), max(cu, cv))
+            entry = super_edges.setdefault(
+                key, {"weight": 0.0, "circuits": []},
+            )
+            entry["weight"] += float(data["weight"])
+            entry["circuits"].extend(data["circuits"])
+
+        return {
+            "h3_resolution": self.cfg.h3_resolution,
+            "note": (
+                "Propuesta de escalado. Superaristas provienen exclusivamente "
+                "de líneas 230 kV cruzando celdas; adyacencia H3 NO es "
+                "conexión eléctrica. Valores B son sintéticos."
+            ),
+            "supernodes": [
+                {
+                    "cell": cell, "members": members,
+                    "B": math.fsum(balances[m] for m in members),
+                    "synthetic": True,
+                }
+                for cell, members in sorted(cell_members.items())
+            ],
+            "superedges": [
+                {"u": u, "v": v,
+                 "weight": e["weight"], "circuits": e["circuits"]}
+                for (u, v), e in sorted(super_edges.items())
+            ],
+        }
+
+    # -- Exportación JSON -----------------------------------------------------
 
     def export(self, h3_layer: dict[str, Any] | None) -> list[Path]:
-       
-        out_dir = self.cfg.out_dir
-        out_dir.mkdir(parents=True, exist_ok=True)
-        generated_utc = datetime.now(timezone.utc).isoformat()
+        """Exporta JSON por instancia, grafo completo e índice."""
+        out = self.cfg.out_dir
+        out.mkdir(parents=True, exist_ok=True)
         metadata = {
             "source": self.source,
-            "generated_utc": generated_utc,
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
             "seed": self.cfg.seed,
             "weight_rule": "inverse_length_proxy",
             "excluded_circuits": [r.raw for r in self.excluded],
@@ -976,20 +794,8 @@ class ICEPowerGridModeler:
 
         for tier, model in self.instances.items():
             index = {name: i for i, name in enumerate(model.variable_order)}
-            # ES: Ising de Max-Cut PURO (sin alpha/beta): C(x) = sum w(1-z_i z_j)/2,
-            #     asi que max C == min [sum (w/2) z_i z_j - sum w/2]. Es el
-            #     Hamiltoniano que debe usar QAOA para el benchmark contra
-            #     brute_force.cut; el "ising" completo (con penalizaciones)
-            #     es un problema distinto y se compara contra h_total.
-            # EN: PURE Max-Cut Ising (no alpha/beta): the Hamiltonian QAOA must
-            #     use for the benchmark against brute_force.cut; the full
-            #     "ising" (with penalties) is a different problem, compared
-            #     against h_total instead.
-            n_vars_export = len(model.variable_order)
-            maxcut_j_upper = np.zeros((n_vars_export, n_vars_export))
-            for i, j, w in model.edges_idx:
-                maxcut_j_upper[i, j] += w / 2.0
-            maxcut_offset = -float(sum(w for _, _, w in model.edges_idx)) / 2.0
+            n = len(model.variable_order)
+
             payload = {
                 "metadata": metadata,
                 "variable_order": model.variable_order,
@@ -1002,21 +808,23 @@ class ICEPowerGridModeler:
                         "B": float(model.balances[index[name]]),
                         "synthetic": True,
                         "is_critical": name == self.cfg.critical_node,
-                        "is_generator_anchor": name in self.cfg.generator_anchors,
+                        "is_generator_anchor": (
+                            name in self.cfg.generator_anchors
+                        ),
                     }
                     for name in model.variable_order
                 ],
                 "edges": [
                     {
-                        "u": u,
-                        "v": v,
+                        "u": u, "v": v,
                         "weight": float(d["weight"]),
                         "length_m": float(d["length_m"]),
                         "circuits": list(d["circuits"]),
                         "parallel": bool(d["parallel"]),
                     }
                     for u, v, d in sorted(
-                        model.graph.edges(data=True), key=lambda e: (e[0], e[1])
+                        model.graph.edges(data=True),
+                        key=lambda e: (e[0], e[1]),
                     )
                 ],
                 "qubo": {
@@ -1029,33 +837,38 @@ class ICEPowerGridModeler:
                     "h": model.h_vec.tolist(),
                     "J_upper": model.j_upper.tolist(),
                     "offset": model.ising_offset,
-                    "problema": "H_total (corte + alpha*balance^2 + beta*critico); "
-                                "comparar contra baselines.h_total, NO contra "
-                                "baselines.maxcut",
+                    "problema": (
+                        "H_total (corte + α·balance² + β·crítico); "
+                        "comparar contra baselines.h_total, NO contra "
+                        "baselines.maxcut"
+                    ),
                 },
                 "ising_maxcut": {
-                    "h": [0.0] * n_vars_export,
-                    "J_upper": maxcut_j_upper.tolist(),
-                    "offset": maxcut_offset,
-                    "problema": "Max-Cut puro (min H == -corte maximo); "
-                                "benchmark contra baselines.maxcut.brute_force",
+                    "h": [0.0] * n,
+                    "J_upper": model.maxcut_j.tolist(),
+                    "offset": model.maxcut_offset,
+                    "problema": (
+                        "Max-Cut puro (min H == -corte máximo); "
+                        "benchmark contra baselines.maxcut.brute_force"
+                    ),
                 },
                 "baselines": model.baselines,
             }
-            path = out_dir / f"isla_verde_{tier}.json"
+            path = out / f"isla_verde_{tier}.json"
             path.write_text(
                 json.dumps(payload, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
             written.append(path)
-            logger.info("Exportado / exported %s", path)
+            logger.info("Exportado %s", path)
 
-      
+        # Grafo completo
         export_graph = nx.Graph()
         for node, data in self.graph.nodes(data=True):
             export_graph.add_node(node, **{
-                "province": data["province"], "x_merc": data["x_merc"],
-                "y_merc": data["y_merc"], "lat": data["lat"], "lon": data["lon"],
+                "province": data["province"],
+                "x_merc": data["x_merc"], "y_merc": data["y_merc"],
+                "lat": data["lat"], "lon": data["lon"],
             })
         for u, v, data in self.graph.edges(data=True):
             export_graph.add_edge(u, v, **{
@@ -1064,11 +877,9 @@ class ICEPowerGridModeler:
                 "circuits": list(data["circuits"]),
                 "parallel": bool(data["parallel"]),
             })
-        try:
-            node_link = nx.node_link_data(export_graph, edges="links")
-        except TypeError:  # networkx < 3.2 no acepta el kwarg / lacks the kwarg
-            node_link = nx.node_link_data(export_graph)
-        graph_path = out_dir / "isla_verde_full_graph.json"
+
+        node_link = nx.node_link_data(export_graph, edges="links")
+        graph_path = out / "isla_verde_full_graph.json"
         graph_path.write_text(
             json.dumps({"metadata": metadata, "graph": node_link},
                        indent=2, ensure_ascii=False),
@@ -1077,7 +888,7 @@ class ICEPowerGridModeler:
         written.append(graph_path)
 
         if h3_layer is not None:
-            h3_path = out_dir / "isla_verde_h3_layer.json"
+            h3_path = out / "isla_verde_h3_layer.json"
             h3_path.write_text(
                 json.dumps({"metadata": metadata, **h3_layer},
                            indent=2, ensure_ascii=False),
@@ -1085,207 +896,201 @@ class ICEPowerGridModeler:
             )
             written.append(h3_path)
 
-        index_payload = {
-            "metadata": metadata,
-            "instances": {
-                tier: f"isla_verde_{tier}.json" for tier in self.instances
-            },
-            "instance_errors": self.instance_errors,
-            "full_graph": "isla_verde_full_graph.json",
-            "h3_layer": ("isla_verde_h3_layer.json"
-                         if h3_layer is not None else None),
-            "figure": "isla_verde_red_230kv.png",
-        }
-        index_path = out_dir / "isla_verde_index.json"
+        index_path = out / "isla_verde_index.json"
         index_path.write_text(
-            json.dumps(index_payload, indent=2, ensure_ascii=False),
+            json.dumps({
+                "metadata": metadata,
+                "instances": {
+                    t: f"isla_verde_{t}.json" for t in self.instances
+                },
+                "instance_errors": self.instance_errors,
+                "full_graph": "isla_verde_full_graph.json",
+                "h3_layer": ("isla_verde_h3_layer.json"
+                             if h3_layer is not None else None),
+                "figure": "isla_verde_red_230kv.png",
+            }, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
         written.append(index_path)
         return written
 
-    # -- M10 ------------------------------------------------------------------
+    # -- Visualización --------------------------------------------------------
 
     def visualize(self) -> Path:
-        
+        """Genera mapa estático de la red 230kV coloreada por provincia."""
         graph = self.graph
-        positions = {
-            n: (d["x_merc"], d["y_merc"]) for n, d in graph.nodes(data=True)
+        pos = {
+            n: (d["x_merc"], d["y_merc"])
+            for n, d in graph.nodes(data=True)
         }
         provinces = sorted({d["province"] for _, d in graph.nodes(data=True)})
-        colormap = plt.get_cmap("tab10")
-        province_color = {
-            p: colormap(i % 10) for i, p in enumerate(provinces)
-        }
-        members = set().union(
-            *(set(m.variable_order) for m in self.instances.values())
-        ) if self.instances else set()
+        cmap = plt.get_cmap("tab10")
+        pcolor = {p: cmap(i % 10) for i, p in enumerate(provinces)}
 
-        max_weight = max(d["weight"] for _, _, d in graph.edges(data=True))
+        members = (
+            set().union(*(set(m.variable_order)
+                          for m in self.instances.values()))
+            if self.instances else set()
+        )
+        max_w = max(d["weight"] for _, _, d in graph.edges(data=True))
         widths = [
-            0.4 + 4.6 * min(d["weight"] / max_weight, 1.0)  # con tope / capped
+            0.4 + 4.6 * min(d["weight"] / max_w, 1.0)
             for _, _, d in graph.edges(data=True)
         ]
 
         fig, ax = plt.subplots(figsize=(14, 10))
         nx.draw_networkx_edges(
-            graph, positions, ax=ax, width=widths, edge_color="0.55"
+            graph, pos, ax=ax, width=widths, edge_color="0.55",
         )
         non_members = [n for n in graph.nodes if n not in members]
         member_nodes = [n for n in graph.nodes if n in members]
+
         nx.draw_networkx_nodes(
-            graph, positions, nodelist=non_members, ax=ax, node_size=55,
-            node_color=[province_color[graph.nodes[n]["province"]]
+            graph, pos, nodelist=non_members, ax=ax, node_size=55,
+            node_color=[pcolor[graph.nodes[n]["province"]]
                         for n in non_members],
         )
         nx.draw_networkx_nodes(
-            graph, positions, nodelist=member_nodes, ax=ax, node_size=110,
-            node_color=[province_color[graph.nodes[n]["province"]]
+            graph, pos, nodelist=member_nodes, ax=ax, node_size=110,
+            node_color=[pcolor[graph.nodes[n]["province"]]
                         for n in member_nodes],
             edgecolors="black", linewidths=1.6,
         )
-        # ES: Solo los miembros de instancias llevan etiqueta.
-        # EN: Only instance members are labeled.
         for name in member_nodes:
-            x, y = positions[name]
             ax.annotate(
-                name, (x, y), textcoords="offset points", xytext=(4, 4),
-                fontsize=8,
+                name, pos[name], textcoords="offset points",
+                xytext=(4, 4), fontsize=8,
             )
+
         handles = [
-            plt.Line2D([], [], marker="o", linestyle="", color=color,
-                       label=province)
-            for province, color in province_color.items()
+            plt.Line2D([], [], marker="o", linestyle="", color=c, label=p)
+            for p, c in pcolor.items()
         ]
         ax.legend(handles=handles, loc="lower right", fontsize=8,
                   title="Provincia")
         ax.set_title(
-            f"ICE {self.cfg.voltage} kV transmission graph "
-            f"({graph.number_of_nodes()} nodes, {graph.number_of_edges()} "
-            f"edges); outlined = NISQ instance members"
+            f"ICE {self.cfg.voltage} kV "
+            f"({graph.number_of_nodes()} nodos, "
+            f"{graph.number_of_edges()} aristas); "
+            f"borde negro = instancias NISQ"
         )
         ax.set_xlabel("Web Mercator X (m)")
         ax.set_ylabel("Web Mercator Y (m)")
         ax.set_aspect("equal")
         fig.tight_layout()
+
         path = self.cfg.out_dir / "isla_verde_red_230kv.png"
         fig.savefig(path, dpi=150)
         plt.close(fig)
-        logger.info("Figura guardada / figure saved to %s", path)
+        logger.info("Figura guardada en %s", path)
         return path
 
-    # -- M11 ------------------------------------------------------------------
+    # -- Auto-verificación ----------------------------------------------------
 
     def run_verification(self) -> bool:
-      
+        """Suite de verificación: consistencia QUBO/Ising y baselines."""
         checks = self.checks
-
         for tier, model in self.instances.items():
-            n_vars = len(model.variable_order)
-            index = {n: i for i, n in enumerate(model.variable_order)}
+            n = len(model.variable_order)
+            index = {name: i for i, name in enumerate(model.variable_order)}
             c_idx = index[self.cfg.critical_node]
             g_idx = index[self.cfg.generator_anchor]
 
-            # 1. ES: Conectividad de instancia, duro. / EN: connectivity, hard.
-            connected = nx.is_connected(model.graph)
-            checks.append((1, f"[{tier}] instance connected", "hard",
-                           connected, f"{n_vars} nodes"))
+            # Conectividad
+            checks.append((
+                1, f"[{tier}] instancia conexa", "hard",
+                nx.is_connected(model.graph), f"{n} nodos",
+            ))
 
-            # 2. ES: Consistencia QUBO vs formula directa, duro.
-            #    EN: QUBO energy consistency vs direct formula, hard.
-            samples = self.rng.integers(0, 2, size=(25, n_vars)).astype(float)
+            # QUBO == fórmula directa
+            samples = self.rng.integers(0, 2, size=(25, n)).astype(float)
             e_qubo = qubo_energies(model.q_matrix, model.qubo_offset, samples)
             cut = cut_values(model.edges_idx, samples)
             balance = (samples @ model.balances) ** 2
             critical = (samples[:, c_idx] - samples[:, g_idx]) ** 2
             e_direct = -cut + model.alpha * balance + model.beta * critical
-            max_err_q = float(np.abs(e_direct - e_qubo).max())
-            checks.append((2, f"[{tier}] QUBO == direct formula (25 samples)",
-                           "hard", max_err_q < 1e-6,
-                           f"max |dE| = {max_err_q:.3e}"))
+            err_q = float(np.abs(e_direct - e_qubo).max())
+            checks.append((
+                2, f"[{tier}] QUBO == formula directa", "hard",
+                err_q < 1e-6, f"max |dE| = {err_q:.3e}",
+            ))
 
-            # 3. ES: Ising igual a QUBO en espines mapeados, duro.
-            #    EN: Ising energy equals QUBO at mapped spins, hard.
+            # Ising == QUBO en espines mapeados
             spins = 1.0 - 2.0 * samples
             e_ising = ising_energies(
-                model.h_vec, model.j_upper, model.ising_offset, spins
+                model.h_vec, model.j_upper, model.ising_offset, spins,
             )
-            max_err_i = float(np.abs(e_ising - e_qubo).max())
-            checks.append((3, f"[{tier}] Ising == QUBO at mapped spins",
-                           "hard", max_err_i < 1e-6,
-                           f"max |dE| = {max_err_i:.3e}"))
+            err_i = float(np.abs(e_ising - e_qubo).max())
+            checks.append((
+                3, f"[{tier}] Ising == QUBO mapeado", "hard",
+                err_i < 1e-6, f"max |dE| = {err_i:.3e}",
+            ))
 
-            # 3b. ES: Ising Max-Cut puro (h=0, J=w/2) == -corte, duro: el
-            #     Hamiltoniano del benchmark QAOA debe reproducir el corte.
-            #     EN: pure Max-Cut Ising (h=0, J=w/2) == -cut, hard: the QAOA
-            #     benchmark Hamiltonian must reproduce the cut exactly.
-            maxcut_j = np.zeros((n_vars, n_vars))
-            for i_e, j_e, w_e in model.edges_idx:
-                maxcut_j[i_e, j_e] += w_e / 2.0
-            maxcut_off = -float(sum(w for _, _, w in model.edges_idx)) / 2.0
-            e_maxcut = ising_energies(
-                np.zeros(n_vars), maxcut_j, maxcut_off, spins
+            # Ising Max-Cut puro == -corte
+            e_mc = ising_energies(
+                np.zeros(n), model.maxcut_j, model.maxcut_offset, spins,
             )
-            max_err_mc = float(np.abs(e_maxcut + cut).max())
-            checks.append((3, f"[{tier}] Max-Cut Ising == -cut (25 samples)",
-                           "hard", max_err_mc < 1e-6,
-                           f"max |dE| = {max_err_mc:.3e}"))
+            err_mc = float(np.abs(e_mc + cut).max())
+            checks.append((
+                3, f"[{tier}] Ising Max-Cut == -corte", "hard",
+                err_mc < 1e-6, f"max |dE| = {err_mc:.3e}",
+            ))
 
-            # 4. ES: Fuerza bruta >= greedy, duro. / EN: brute >= greedy, hard.
+            # Fuerza bruta >= greedy
             brute = model.baselines["maxcut"]["brute_force"]["cut"]
             greedy = model.baselines["maxcut"]["greedy"]["cut"]
-            checks.append((4, f"[{tier}] brute-force cut >= greedy cut",
-                           "hard", brute >= greedy - 1e-9,
-                           f"brute {brute:.4f} vs greedy {greedy:.4f}"))
+            checks.append((
+                4, f"[{tier}] brute >= greedy", "hard",
+                brute >= greedy - 1e-9,
+                f"brute {brute:.4f} vs greedy {greedy:.4f}",
+            ))
 
-            # 5. ES: GW >= 0.878 x optimo, suave (garantia en esperanza).
-            #    EN: GW >= 0.878 x optimum, soft (guarantee in expectation).
+            # GW >= 0.878 × óptimo
             gw = model.baselines["maxcut"]["goemans_williamson"]
-            if gw is None:
-                checks.append((5, f"[{tier}] GW >= 0.878 x optimum", "soft",
-                               None, "skipped: cvxpy/solver unavailable"))
-            else:
-                ratio = gw["cut"] / brute if brute > 0 else 1.0
-                checks.append((5, f"[{tier}] GW >= 0.878 x optimum", "soft",
-                               ratio >= 0.878, f"ratio = {ratio:.4f}"))
+            ratio = gw["cut"] / brute if brute > 0 else 1.0
+            checks.append((
+                5, f"[{tier}] GW >= 0.878 x optimo", "soft",
+                ratio >= 0.878, f"ratio = {ratio:.4f}",
+            ))
 
-            # 6. ES: Suma de B cero por instancia, duro.
-            #    EN: sum B == 0 per instance, hard.
+            # Suma B == 0
             b_sum = abs(math.fsum(model.balances.tolist()))
-            checks.append((6, f"[{tier}] sum(B) == 0 (tol 1e-9)", "hard",
-                           b_sum < 1e-9, f"|sum B| = {b_sum:.3e}"))
+            checks.append((
+                6, f"[{tier}] sum(B) == 0", "hard",
+                b_sum < 1e-9, f"|sum B| = {b_sum:.3e}",
+            ))
 
-            # 7. ES: Restriccion critica en el optimo de H_total, duro.
-            #    EN: critical constraint at the H_total optimum, hard.
-            checks.append((7, f"[{tier}] x_c == x_g at H_total optimum",
-                           "hard", model.critical_satisfied,
-                           f"beta = {model.beta:.6g}"))
+            # Restricción crítica satisfecha
+            checks.append((
+                7, f"[{tier}] x_c == x_g en óptimo", "hard",
+                model.critical_satisfied, f"beta = {model.beta:.6g}",
+            ))
 
         checks.sort(key=lambda c: c[0])
         width = max(len(c[1]) for c in checks)
         print()
-        print(f"{'#':>2}  {'check':<{width}}  {'type':<4}  {'status':<6}  detail")
+        print(f"{'#':>2}  {'check':<{width}}  {'tipo':<4}  "
+              f"{'estado':<6}  detalle")
         print("-" * (width + 40))
         hard_ok = True
-        for num, description, level, passed, detail in checks:
+        for num, desc, level, passed, detail in checks:
             status = ("SKIP" if passed is None
                       else "PASS" if passed
                       else "WARN" if level == "soft" else "FAIL")
             if status == "FAIL":
                 hard_ok = False
-            print(f"{num:>2}  {description:<{width}}  {level:<4}  "
+            print(f"{num:>2}  {desc:<{width}}  {level:<4}  "
                   f"{status:<6}  {detail}")
         print("-" * (width + 40))
-        print(f"overall: {'PASS' if hard_ok else 'FAIL'}")
+        print(f"resultado: {'PASS' if hard_ok else 'FAIL'}")
         return hard_ok
 
-    # -- Orquestacion / Orchestration -----------------------------------------
+    # -- Orquestación ---------------------------------------------------------
 
     def run(self) -> int:
-        """ES: Ejecuta M1 -> M11; retorna el codigo de salida del proceso.
-        EN: Executes M1 -> M11; returns the process exit code."""
+        """Ejecuta el pipeline completo."""
         logger.info(
-            "ISLA VERDE Fase/Phase 1 | seed=%d | data_dir=%s | out_dir=%s",
+            "ISLA VERDE Fase 1 | seed=%d | data=%s | out=%s",
             self.cfg.seed, self.cfg.data_dir, self.cfg.out_dir,
         )
         loaded = self.load_data()
@@ -1295,8 +1100,6 @@ class ICEPowerGridModeler:
             self.build_graph(*loaded)
 
         subgraphs = self.extract_instances()
-        # ES: Orden fijo del dict: mvp8, std12, large16 (RNG determinista).
-        # EN: Fixed dict order: mvp8, std12, large16 (deterministic RNG use).
         for tier, subgraph in subgraphs.items():
             model = self.formulate_instance(tier, subgraph)
             self.compute_baselines(model)
@@ -1305,44 +1108,47 @@ class ICEPowerGridModeler:
         h3_layer = self.build_h3_layer()
         self.export(h3_layer)
         self.visualize()
-
-        passed = self.run_verification()
-        return 0 if passed else 1
+        return 0 if self.run_verification() else 1
 
 
 # ---------------------------------------------------------------------------
-# Punto de entrada / Entry point
+# Punto de entrada
 # ---------------------------------------------------------------------------
 
 
 def parse_args(argv: Sequence[str] | None = None) -> Config:
-    """ES: Construye la Config con overrides de CLI (data_dir, out_dir, seed).
-    EN: Builds the run Config from CLI overrides (data_dir, out_dir, seed)."""
+    """Construye Config desde argumentos CLI."""
     parser = argparse.ArgumentParser(
-        description="ISLA VERDE Fase 1 / Phase 1: red ICE 230 kV -> QUBO/Ising"
+        description="ISLA VERDE Fase 1: red ICE 230kV → QUBO/Ising",
     )
-    defaults = Config()
-    parser.add_argument("--data-dir", type=Path, default=defaults.data_dir,
-                        help="directorio con los dos CSV del ICE / CSV dir")
-    parser.add_argument("--out-dir", type=Path, default=defaults.out_dir,
-                        help="directorio de salida / output dir")
-    parser.add_argument("--seed", type=int, default=defaults.seed,
-                        help="semilla del RNG unico / single RNG seed (42)")
+    d = Config()
+    parser.add_argument(
+        "--data-dir", type=Path, default=d.data_dir,
+        help="directorio con los CSV del ICE",
+    )
+    parser.add_argument(
+        "--out-dir", type=Path, default=d.out_dir,
+        help="directorio de salida",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=d.seed,
+        help="semilla del RNG (default: 42)",
+    )
     args = parser.parse_args(argv)
     return Config(data_dir=args.data_dir, out_dir=args.out_dir, seed=args.seed)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """ES: Punto de entrada CLI; retorna el codigo de salida.
-    EN: CLI entry point; returns the process exit code."""
+    """Punto de entrada CLI."""
     logging.basicConfig(
-        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
     )
     cfg = parse_args(argv)
     try:
         return ICEPowerGridModeler(cfg).run()
     except (CalibrationError, AssertionError, ValueError) as exc:
-        logger.error("Pipeline abortado / aborted: %s", exc)
+        logger.error("Pipeline abortado: %s", exc)
         return 1
 
 
